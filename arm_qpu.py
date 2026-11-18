@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Run an AArch64 binary on a quantum stored-program (von Neumann) processor.
 
-    python3 arm_qpu.py prog.o --entry factor --args 91 [--mem 1,2,3] [--config config.json]
+    python3 arm_qpu.py prog.c --entry factor --args 91            # compiles with clang or gcc first
+    python3 arm_qpu.py prog.o --entry factor --args 91 [--mem=1,2,3] [--config config.json]
 
 The same machine code runs on a CPU (Unicorn AArch64 emulator, as reference) and on the
 quantum interpreter circuit (backend from config.json: simulator | aer | ibm). A report
 (Markdown + JSON) lists unsupported instructions, resources and the CPU/QPU comparison.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qcpu.a64 import check, disassemble, ALL_CLASSES, MEMOPS
 from qcpu.loader import load_program
@@ -22,6 +23,8 @@ DEFAULTS = {
     "memory_words": "auto",          # data memory cells (4 bytes each); auto = 2^(W-4) if the code uses memory
     "max_steps": "auto",             # auto = number of steps the CPU reference needs
     "isa": "full",                   # full = every implemented class in the decoder | auto = only classes used
+    "compiler": "auto",              # for .c input: auto | clang | gcc | a command name / path
+    "cflags": ["-O1"],
     "shots": 1024,
     "aer": {"method": "matrix_product_state"},
     "ibm": {"channel": "ibm_quantum_platform", "token": "env:IBM_QUANTUM_TOKEN", "instance": None,
@@ -41,6 +44,35 @@ def load_config(path):
     return cfg
 
 
+GCC_NAMES = ["aarch64-linux-gnu-gcc", "aarch64-none-linux-gnu-gcc", "aarch64-none-elf-gcc", "aarch64-elf-gcc"]
+
+
+def find_compiler(choice):
+    """Return the command prefix that compiles C to an AArch64 object file."""
+    if choice in ("auto", "clang") and shutil.which("clang"):
+        return ["clang", "--target=aarch64-linux-gnu"]
+    if choice in ("auto", "gcc"):
+        for name in GCC_NAMES:
+            if shutil.which(name):
+                return [name]
+        if choice == "gcc":
+            sys.exit("error: no AArch64 gcc found (tried " + ", ".join(GCC_NAMES) + "); see README")
+    if choice not in ("auto", "clang", "gcc") and shutil.which(choice):
+        return [choice] + (["--target=aarch64-linux-gnu"] if "clang" in os.path.basename(choice) else [])
+    sys.exit(f"error: compiler '{choice}' not found; install clang or an AArch64 gcc (see README)")
+
+
+def compile_c(src, choice, cflags):
+    cc = find_compiler(choice)
+    out = os.path.join(tempfile.mkdtemp(prefix="arm_qpu_"), os.path.splitext(os.path.basename(src))[0] + ".o")
+    cmd = cc + list(cflags) + ["-ffreestanding", "-c", src, "-o", out]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode:
+        sys.exit("compile failed: " + " ".join(cmd) + "\n" + p.stderr)
+    print("compiled: " + " ".join(cmd))
+    return out, " ".join(cmd)
+
+
 def sx(v, W):
     v &= (1 << W) - 1
     return v - (1 << W) if v >> (W - 1) else v
@@ -55,7 +87,9 @@ def parse_val(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("binary", help="AArch64 ELF/Mach-O object or executable, or raw .bin")
+    ap.add_argument("binary", help="C source (.c), AArch64 ELF/Mach-O object or executable, or raw .bin")
+    ap.add_argument("--cc", help="compiler for .c input: clang | gcc | command (overrides config)")
+    ap.add_argument("-O", dest="opt", help="optimization level for .c input, e.g. -O2 (overrides config cflags)")
     ap.add_argument("--entry", help="function to run (default: main, else the first function)")
     ap.add_argument("--args", nargs="*", default=[], help="X0, X1, ... initial values; '&k' = pointer to data cell k")
     ap.add_argument("--mem", default="", help="initial data memory cells (32-bit ints), comma separated")
@@ -63,6 +97,13 @@ def main():
     ap.add_argument("--report", help="report path prefix (default: <binary>.<entry>.report)")
     a = ap.parse_args()
     cfg = load_config(a.config)
+    compiled_with = None
+    source = a.binary
+    if a.binary.endswith(".c"):
+        cflags = [f for f in cfg["cflags"] if not f.startswith("-O")] + [f"-O{a.opt}"] if a.opt else cfg["cflags"]
+        obj, compiled_with = compile_c(a.binary, a.cc or cfg["compiler"], cflags)
+        a.report = a.report or f"{os.path.splitext(a.binary)[0]}.{a.entry or 'main'}.report"
+        a.binary = obj
 
     prog = load_program(a.binary, a.entry)
     code = prog["words"]
@@ -119,7 +160,7 @@ def main():
         executed[i] = executed.get(i, 0) + 1
     steps = ref["steps"] if cfg["max_steps"] == "auto" else int(cfg["max_steps"])
 
-    report = dict(binary=a.binary, entry=prog["entry"], entry_index=prog["entry_index"], args=a.args,
+    report = dict(binary=a.binary, source=source, compiled_with=compiled_with, entry=prog["entry"], entry_index=prog["entry_index"], args=a.args,
                   memory_init=mem_init, config=cfg, unresolved_relocations=prog["unresolved"])
     report["code"] = [dict(index=i, address=f"0x{CODE_BASE + 4 * i:x}", word=f"{w:08x}", asm=asm[i],
                            function=names_at.get(i), cls=checks[i].cls, supported=checks[i].ok,
@@ -268,7 +309,8 @@ def markdown(r, W):
     res = r.get("result")
     if res:
         L += [f"Return value X0: CPU = **{res['return_value']['cpu']}**, QPU = **{res['return_value']['qpu']}**", ""]
-    L += ["## Input", "", f"- binary: `{r['binary']}`, function `{r['entry']}` (instruction {r['entry_index']})",
+    L += ["## Input", ""] + ([f"- source: `{r['source']}`, compiled with `{r['compiled_with']}`"] if r.get("compiled_with") else []) + [
+          f"- binary: `{r['binary']}`, function `{r['entry']}` (instruction {r['entry_index']})",
           f"- arguments: {' '.join(r['args']) or '(none)'}; data memory init: {r['memory_init'] or '(none)'}",
           f"- backend: `{r['config']['backend']}`, register width W = {W}", ""]
     if r["unsupported"]:

@@ -5,6 +5,8 @@
   "memory_words": "auto",
   "max_steps": "auto",
   "isa": "full",
+  "compiler": "auto",
+  "cflags": ["-O1"],
   "shots": 1024,
   "aer": {"method": "matrix_product_state"},
   "ibm": {

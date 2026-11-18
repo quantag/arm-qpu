@@ -35,31 +35,19 @@ int factorize(int n, int *out) {          /* writes the prime factors to out[] *
 }
 ```
 
-Compile it to an AArch64 object file (any of these):
+One command compiles it for AArch64 and runs it on the QPU and the CPU (`&0` = pointer to
+data-memory cell 0, where the factors are written):
 
 ```bash
-# Linux / any OS with clang (cross-compiles, no ARM machine needed)
-clang --target=aarch64-linux-gnu -O1 -c examples/factor.c -o factor.o
-
-# macOS on Apple Silicon (native arm64 Mach-O)
-clang -O1 -c examples/factor.c -o factor.o
-
-# GCC cross toolchain
-aarch64-linux-gnu-gcc -O1 -c examples/factor.c -o factor.o
-```
-
-Run it on the QPU (`&0` = pointer to data-memory cell 0, where the factors are written):
-
-```bash
-pip install -r requirements.txt
-python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
 ```
 
 ```
+compiled: clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o .../factor.o
 MATCH: the QPU produced the same result as the CPU
 return value X0: CPU = 4, QPU = 4
-quantum machine: 26903 qubits, 4616376 gates (2564408 Toffoli), 92 steps
-report: factor.factorize.report.md
+quantum machine: 21201 qubits, 3491712 gates (1917792 Toffoli), 72 steps
+report: examples/factor.factorize.report.md
 ```
 
 The report shows data memory `[2, 2, 3, 7, ...]` on both machines, identical registers,
@@ -68,7 +56,116 @@ not, and the circuit's resources.
 
 Options: `--entry FUNC` (default `main`, else the first function), `--args` for X0, X1, ...
 (`&k` = pointer to data cell k), `--mem=1,2,3` to initialise data memory (32-bit cells),
-`--config config.json`, `--report PREFIX`.
+`--cc clang|gcc` and `-O 0|1|2|s` for `.c` input, `--config config.json`, `--report PREFIX`.
+
+## Compiling C to an ARM64 binary: clang or gcc
+
+Both compilers are supported and tested; they produce the same results. You can pass a `.c`
+file (the runner compiles it), or compile yourself and pass the object file (`.o`).
+
+| compiler | command | output |
+|---|---|---|
+| clang, any OS (cross-compiles, no ARM machine needed) | `clang --target=aarch64-linux-gnu -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
+| clang on macOS, Apple Silicon | `clang -O1 -c prog.c -o prog.o` | Mach-O |
+| gcc, Linux cross toolchain | `aarch64-linux-gnu-gcc -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
+| gcc, Arm GNU Toolchain (Windows, macOS, Linux) | `aarch64-none-elf-gcc -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
+| gcc on a native ARM64 Linux machine (Raspberry Pi, Graviton, ...) | `gcc -O1 -c prog.c -o prog.o` | ELF |
+
+```bash
+python3 arm_qpu.py prog.o --entry my_function --args 5 7
+```
+
+With `.c` input, `compiler` in `config.json` (or `--cc`) chooses the compiler. `auto` tries
+`clang`, then `aarch64-linux-gnu-gcc`, `aarch64-none-linux-gnu-gcc`, `aarch64-none-elf-gcc`
+and `aarch64-elf-gcc`. Write plain functions with no libc calls: there is no `printf` or
+`malloc` on the quantum machine. Return results in the return value or through a pointer
+argument (`&k`).
+
+## Step-by-step: Linux (Ubuntu / Debian)
+
+```bash
+# 1. tools: Python, git, and a compiler (clang, or gcc for AArch64, or both)
+sudo apt update
+sudo apt install -y python3 python3-venv git clang gcc-aarch64-linux-gnu
+
+# 2. get the code and its Python packages
+git clone https://github.com/quantag/arm-qpu.git
+cd arm-qpu
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. run C on the quantum machine, with either compiler
+python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
+python3 arm_qpu.py examples/factor.c --cc gcc --entry factorize --args 84 '&0'
+
+# 4. or compile yourself and pass the object file
+aarch64-linux-gnu-gcc -O2 -c examples/algorithms.c -o algorithms.o
+python3 arm_qpu.py algorithms.o --entry gcd --args 84 36
+
+# 5. the report
+less examples/factor.factorize.report.md
+```
+
+On Fedora: `sudo dnf install clang gcc-aarch64-linux-gnu python3 git`. On Arch Linux:
+`sudo pacman -S clang aarch64-linux-gnu-gcc python git`.
+
+## Step-by-step: Windows
+
+### Option A: native Windows (PowerShell)
+
+```powershell
+# 1. Python, git and clang/LLVM (clang includes the AArch64 cross compiler)
+winget install -e --id Python.Python.3.12
+winget install -e --id Git.Git
+winget install -e --id LLVM.LLVM
+# open a NEW PowerShell window so PATH picks up python, git and clang
+
+# 2. get the code and its Python packages
+git clone https://github.com/quantag/arm-qpu.git
+cd arm-qpu
+py -m venv .venv
+.venv\Scripts\Activate.ps1        # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+pip install -r requirements.txt
+
+# 3. run C on the quantum machine (keep '&0' in single quotes in PowerShell)
+python arm_qpu.py examples\factor.c --entry factorize --args 84 '&0'
+```
+
+**gcc on Windows.** Use the Arm GNU Toolchain:
+
+1. Download the Windows-hosted (mingw-w64) package for the target "AArch64 bare-metal
+   (aarch64-none-elf)" from https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads.
+2. Unzip it, for example to `C:\arm-gnu-toolchain`.
+3. Add its `bin` folder to PATH, then check: `aarch64-none-elf-gcc --version`.
+4. Run with gcc:
+
+```powershell
+python arm_qpu.py examples\factor.c --cc gcc --entry factorize --args 84 '&0'
+# or compile yourself:
+aarch64-none-elf-gcc -O1 -ffreestanding -c examples\factor.c -o factor.o
+python arm_qpu.py factor.o --entry factorize --args 84 '&0'
+```
+
+In `cmd.exe` write the pointer argument as `"&0"` (double quotes).
+
+### Option B: WSL2 (Linux inside Windows)
+
+```powershell
+wsl --install -d Ubuntu      # once, then reboot and open "Ubuntu" from the Start menu
+```
+
+Inside Ubuntu, follow the Linux steps above. This gives you both compilers through `apt`.
+
+## Step-by-step: macOS (Apple Silicon)
+
+```bash
+xcode-select --install                 # Apple clang (native arm64)
+git clone https://github.com/quantag/arm-qpu.git && cd arm-qpu
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
+# gcc: brew install aarch64-elf-gcc, then add --cc gcc
+```
 
 ## config.json
 
@@ -80,6 +177,8 @@ Options: `--entry FUNC` (default `main`, else the first function), `--args` for 
   "memory_words": "auto",
   "max_steps": "auto",
   "isa": "full",
+  "compiler": "auto",
+  "cflags": ["-O1"],
   "shots": 1024,
   "aer": {"method": "matrix_product_state"},
   "ibm": {"channel": "ibm_quantum_platform", "token": "env:IBM_QUANTUM_TOKEN",
@@ -95,6 +194,8 @@ Options: `--entry FUNC` (default `main`, else the first function), `--args` for 
 | `memory_words` | data memory in 4-byte cells; `auto` = 2^(W-4) if the code touches memory. |
 | `max_steps` | machine cycles in the circuit; `auto` = what the CPU reference needed. |
 | `isa` | `full` = decoder implements every supported class; `auto` = only the classes the program uses (smaller circuit). |
+| `compiler` | for `.c` input: `auto`, `clang`, `gcc`, or a command name / path. |
+| `cflags` | compiler flags for `.c` input, default `["-O1"]`. |
 
 Before submitting to hardware the runner checks the circuit's width against the device. A run
 that does not fit is reported as not submitted, with the reason.
@@ -125,9 +226,9 @@ machine reproduces the AArch64 result exactly: the low W bits of every register 
 cell, the NZCV flags, and the control flow.
 
 The CPU reference checks every value of the run and lists any that does not fit in the
-report's "Model check" section. Example: at `-O1`, clang compiles `n / 10` as a multiply by
-`0xCCCCCCCD` and a 35-bit shift. Those values cannot fit in W ≤ 16, so the report flags them.
-The same function at `-O0` (a real `sdiv`) matches.
+report's "Model check" section. Example: clang at `-O1` (and gcc at every level) compiles
+`n / 10` as a multiply by `0xCCCCCCCD` and a 35-bit shift. Those values cannot fit in W ≤ 16,
+so the report flags them. With clang at `-O0` the same function is a real `sdiv` and matches.
 
 Code addresses are `4 × slot` and data pointers are offsets into data memory. Both must be
 non-negative W-bit values, which is why `register_width: auto` grows W with program size.
@@ -135,13 +236,17 @@ non-negative W-bit values, which is why `register_width: auto` grows W with prog
 ## Tests
 
 ```bash
-python3 -m tests.test_c_programs    # 16 C cases x -O0/-O1/-O2 through arm_qpu.py (examples/*.c)
+python3 -m tests.test_c_programs clang   # 16 C cases x -O0/-O1/-O2 through arm_qpu.py (examples/*.c)
+python3 -m tests.test_c_programs gcc     # the same with aarch64-linux-gnu-gcc
 python3 -m tests.test_fuzz 500      # random A64 programs: one circuit, CPU vs QPU, regs/flags/memory/trace
 ```
 
 `test_c_programs` covers factorization, gcd, Fibonacci, primality, popcount, Collatz, integer
 square root, modular exponentiation, max3, function calls, bubble sort (in memory) and binary
-search. Every case matches the CPU, except the two flagged `digit_sum` cases described above.
+search. With both clang and gcc every case matches the CPU, except the flagged `digit_sum`
+cases described above (gcc uses the multiply-by-constant trick even at `-O0`).
+The largest case (`bubble_sort` at `-O0`, about 800 000 qubits and 180 million gates) needs
+several GB of RAM. Run the two suites one after the other, not in parallel.
 
 ## How the quantum machine works
 

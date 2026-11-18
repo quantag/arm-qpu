@@ -109,7 +109,7 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
         view = v & ((1 << ds) - 1)
         if _sext(view & mask, W) % (1 << ds) == view:
             return True
-        if ds == 64 and (0 <= v - DATA_BASE < (1 << (W - 1)) or 0 <= v - CODE_BASE < (1 << (W - 1))):
+        if ds == 64 and (-(1 << (W - 1)) <= v - DATA_BASE < (1 << (W - 1)) or 0 <= v - CODE_BASE < (1 << (W - 1))):
             return True                                    # pointer into data memory / code
         return False
 
