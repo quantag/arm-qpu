@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.report.md
 *.report.json
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.blg

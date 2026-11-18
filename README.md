@@ -11,7 +11,7 @@ Hello from the QPU!
 ```
 
 The quantum processor is **one fixed reversible circuit** (X, CNOT, Toffoli, Fredkin gates).
-It has program memory, a program counter, fetch, a decoder for 32 A64 instruction classes,
+It has program memory, a program counter, fetch, a decoder for 27 A64 instruction classes,
 31 registers + SP, NZCV flags, data memory with a stack, an ALU (adder, barrel shifter,
 multiplier, divider, bitmask decoder), and a branch unit with calls and returns.
 The binary is **not compiled into the circuit**: its 32-bit instruction words are loaded as

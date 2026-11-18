@@ -1,0 +1,575 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\emergencystretch=1.5em
+
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,frame=single,
+        framerule=0.4pt,rulecolor=\color{black!30},xleftmargin=4pt,xrightmargin=4pt}
+
+\title{A Quantum von Neumann Machine that Runs Unmodified ARM64 Binaries}
+% TODO: replace with the real author name(s) and e-mail before submission
+\author{[Author Name]\\ Quantag\\ \texttt{[e-mail]}}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We demonstrate that a quantum computer can execute unmodified ARM64 (AArch64) machine code
+and implement a stored-program von Neumann architecture entirely with quantum gates. We
+construct a single, fixed reversible quantum circuit---built only from X, CNOT, Toffoli and
+Fredkin gates---that contains program memory, a program counter, instruction fetch, a
+decoder for 27 classes of A64 instructions, a register file, condition flags, data memory
+with a stack, an arithmetic and logic unit with multiplication and division, and a branch
+unit with function calls. The binary is not compiled into the circuit: its 32-bit
+instruction words are loaded as the initial basis state of program-memory qubits, and the
+same circuit executes any program. Ordinary C programs compiled by clang or gcc run on this
+machine, including programs that call \texttt{printf}, and their output, registers, memory
+and step-by-step control flow match an ARM CPU reference exactly in every tested case. We
+also show that the machine executes a superposition of two ARM programs coherently. The
+results are obtained by exact simulation of the circuit; the circuits require from several
+hundred to more than a million qubits and up to $1.6\times10^{8}$ Toffoli gates, far beyond
+current hardware. The construction is not efficient and offers no computational advantage:
+it is a proof of principle that the classical stored-program model, and real-world machine
+code, can be carried by a quantum computer. Code, examples and tests are available at
+\url{https://github.com/quantag/arm-qpu}.
+\end{abstract}
+
+\section{Introduction}
+
+Today's quantum computers are coprocessors. A classical computer holds the program, decides
+which gate comes next and reads the results; the quantum processor only applies the gates
+it is told to apply. The von Neumann idea of a \emph{stored-program} computer---one machine,
+whose behaviour is set by a program held in its own memory and interpreted by a fetch,
+decode and execute cycle---has been studied for quantum computers mostly as an architectural
+or theoretical model~\cite{mariantoni2011,wang2022prototype,liu2023survey,wang2024family,yuan2024qcm,zhang2025qrm}.
+
+In this paper we take the most literal route. We ask whether a quantum computer can run the
+\emph{same machine code} as a conventional processor: the bytes that a standard C compiler
+produces for an ARM64 CPU, unmodified. We answer this in the affirmative by building a
+quantum circuit that interprets AArch64 instructions~\cite{armarm}. The circuit is a complete
+stored-program machine: the program lives in qubits, a program counter held in qubits selects
+the next instruction, a decoder made of gates determines what it means, and the execution
+units update registers, flags and memory. Nothing in the circuit is measured or decided
+classically while it runs.
+
+Classical reversible computation embeds in quantum computation because the Toffoli gate is
+universal for reversible logic~\cite{toffoli1980,fredkin1982,nielsen2010}. That such a machine
+can exist is therefore not in doubt. What is new is a working, tested construction for a
+real, widely used instruction set, driven by real compiler output, with a reference CPU
+checking every run.
+
+We are explicit about what this is not. It is not efficient: a single machine cycle costs
+hundreds of thousands of gates, and a short C program needs hundreds of thousands to more
+than a million qubits. It is not a speed-up: a classical program executed on a quantum
+computer is simply a very expensive reversible computer. It has not been run on physical
+quantum hardware, which is orders of magnitude too small and too noisy for it. The results
+are obtained by exact simulation of the circuit. The contribution is a demonstration of
+principle, and a verified bridge from ordinary binaries to quantum circuits.
+
+Our contributions are:
+\begin{itemize}
+  \item a quantum stored-program machine for a substantial subset of AArch64 (27 instruction
+        classes covering integer arithmetic, logic, shifts, multiply and divide, conditional
+        select and compare, all common branches and calls, and 32/64-bit loads and stores with
+        all addressing modes);
+  \item a toolchain that loads ELF and Mach-O objects produced by clang or gcc, links them,
+        runs them on the quantum machine and on a CPU reference, and reports the comparison;
+  \item support for \texttt{printf}, \texttt{puts} and \texttt{putchar}, so that ordinary
+        C programs print their results as if they had been run locally;
+  \item an evaluation by differential testing against an ARM CPU emulator, and a coherence
+        experiment in which the machine executes a superposition of two programs.
+\end{itemize}
+
+\section{Background and related work}
+
+\paragraph{Quantum von Neumann architectures.}
+Mariantoni et al.~\cite{mariantoni2011} demonstrated a superconducting quantum processor
+exchanging data with a quantum memory; the instructions were stored on a classical computer.
+Wang and coworkers developed theoretical models of a universal quantum von Neumann
+architecture with quantum program memory, control unit and processing unit
+\cite{wang2022prototype,liu2023survey,wang2024family}. These works treat programs as quantum
+states in general; our machine stores classical programs in qubits and interprets a
+classical instruction set.
+
+\paragraph{Quantum control flow.}
+Yuan, Villanyi and Carbin~\cite{yuan2024qcm} prove that a classical conditional jump cannot
+be lifted to a program counter in superposition: the transition function of a jump is not
+injective, so no quantum embedding exists without an auxiliary history, and that history is
+entangled with the data. They give necessary and sufficient conditions (injectivity and
+synchronisation) and define the Quantum Control Machine, an instruction set whose program
+counter advances by a branch register. Zhang and Ying~\cite{zhang2025qrm} propose the Quantum
+Register Machine, with quantum control flow (\texttt{qif}/\texttt{fiq}), recursion and a
+partial-evaluation step that synchronises branches. Both define new instruction sets; our
+machine executes an existing one, and Section~\ref{sec:vonneumann} relates its design to their
+conditions. Yuan and Carbin also study data structures in superposition~\cite{yuan2022tower}.
+
+\paragraph{Classical CPUs on quantum computers.}
+Fitzjohn et al.\ built Qx86~\cite{fitzjohn2022,fitzjohn2024}, an Intel 8080/Z80 emulator in
+which instructions are executed by quantum circuits on IBM hardware. Their program counter,
+fetch and decode remain classical, and each instruction runs as a separate quantum job. In
+our machine fetch, decode and control flow are themselves part of one quantum circuit.
+
+\paragraph{Reversible computing.}
+Landauer~\cite{landauer1961} and Bennett~\cite{bennett1973} showed how irreversible
+computation can be embedded in reversible computation by keeping or uncomputing history.
+Reversible processor architectures and instruction sets have been designed for classical
+reversible hardware~\cite{axelsen2007,vieri1999}. Compilers from high-level code to reversible
+circuits exist~\cite{amy2017reverc}; they compile a program into a circuit, whereas our
+circuit is an interpreter that is independent of the program.
+
+\section{The quantum stored-program machine}
+\label{sec:machine}
+
+\subsection{Machine state}
+
+The machine is parameterised by a register width $W$ (between 8 and 16 bits), the number of
+program-memory slots $S$ (a power of two), the size of data memory and the number of machine
+cycles $T$. Its state consists of qubit registers:
+\begin{itemize}
+  \item \textbf{program memory}: $S$ words of 32 qubits, one A64 instruction word each;
+  \item \textbf{program counter} (PC): $\log_2 S$ qubits, an instruction index;
+  \item \textbf{register file}: the general-purpose registers X0--X30 that the program uses,
+        and the stack pointer SP, $W$ qubits each;
+  \item \textbf{flags}: N, Z, C, V;
+  \item \textbf{data memory}: 4-byte cells of $W$ qubits;
+  \item a \textbf{running} qubit, cleared when the program halts.
+\end{itemize}
+A program is loaded by preparing the computational basis state that holds its instruction
+words in program memory, the entry point in the PC, the arguments in X0--X7 and the initial
+data in data memory. The circuit itself is the same for every program of the given size.
+
+\subsection{One machine cycle}
+
+The circuit is $T$ repetitions of one machine cycle. Each cycle is a reversible block in five
+phases (Figure~\ref{fig:cycle}):
+
+\begin{enumerate}
+  \item \textbf{Fetch.} The instruction register (32 scratch qubits) receives
+        $\mathrm{IR} \mathrel{\oplus}= \mathrm{MEM}[\mathrm{PC}]$. For each slot, a comparator on
+        the PC qubits computes a select qubit, and Toffoli gates copy that slot's word.
+  \item \textbf{Decode.} Each instruction class is a (mask, value) pattern on the IR bits; a
+        multi-controlled NOT per class, also controlled by the running qubit, yields one-hot
+        class flags. If no class matches, a trap qubit is set and the machine halts.
+  \item \textbf{Execute.} Register reads are multiplexers on the register fields of the IR.
+        The execution units then compute, on scratch qubits: a ripple-carry adder with
+        carry and overflow, a barrel shifter, a shift-and-add multiplier, a restoring
+        divider, the decoder for logical bitmask immediates, condition evaluation on NZCV,
+        address generation for loads and stores, and the next PC.
+  \item \textbf{Copy out, then uncompute.} The cycle's results (the values to be written,
+        the write enables, the new flags, the next PC, memory write data and enables) are
+        copied with CNOTs into fresh per-cycle registers. The whole compute block is then
+        applied in reverse, so that every scratch qubit returns to $|0\rangle$.
+  \item \textbf{Commit.} Controlled-SWAP gates move the per-cycle results into the
+        architectural registers, flags and memory cells. The displaced old values stay
+        behind in the per-cycle registers. The next PC simply becomes the PC register of
+        the following cycle; the old PC register stays behind as well.
+\end{enumerate}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=4mm, every node/.style={font=\small},
+  box/.style={draw, rounded corners=2pt, minimum height=8mm, align=center, inner sep=3pt},
+  arr/.style={-{Stealth[length=2mm]}}]
+\node[box] (f) {Fetch\\ $\mathrm{IR}\oplus=\mathrm{MEM[PC]}$};
+\node[box, right=of f] (d) {Decode\\ one-hot classes};
+\node[box, right=of d] (e) {Execute\\ ALU, shifter, mul, div,\\ address, next PC};
+\node[box, right=of e] (c) {Copy out\\ to per-cycle regs};
+\node[box, below=8mm of c] (u) {Uncompute\\ reverse of fetch \dots\ execute};
+\node[box, left=of u] (m) {Commit\\ controlled-SWAP};
+\draw[arr] (f) -- (d); \draw[arr] (d) -- (e); \draw[arr] (e) -- (c);
+\draw[arr] (c) -- (u); \draw[arr] (u) -- (m);
+\node[draw, dashed, rounded corners=3pt, fit=(f)(d)(e)(c)(u)(m), inner sep=4pt,
+      label={[font=\small]above:one machine cycle, repeated $T$ times}] {};
+\end{tikzpicture}
+\caption{The reversible machine cycle. Scratch qubits used in fetch, decode and execute are
+returned to $|0\rangle$ by the uncompute phase; results reach the machine state only
+through controlled-SWAPs in the commit phase.}
+\label{fig:cycle}
+\end{figure}
+
+This is a Landauer embedding~\cite{landauer1961,bennett1973}. Overwriting a register or
+jumping are not injective operations, but swapping the new value in and keeping the old one
+is unitary. The price is $O(W)$ history qubits per cycle for each written register and memory
+cell, plus the old PC. The PC history doubles as a complete execution trace.
+
+\subsection{Halting and synchronisation}
+
+The entry function is called with its link register (X30) pointing at a reserved program
+slot that holds the instruction \texttt{HLT}. When the function returns, the machine reaches
+\texttt{HLT}, clears the running qubit, and every remaining cycle becomes the identity: all
+class flags are controlled by the running qubit, so nothing is written and the next PC equals
+the PC. The number of cycles $T$ is fixed in advance and need only be at least the number of
+instructions executed. This is the synchronisation condition of~\cite{yuan2024qcm}: every
+computation ends after the same number of cycles in the same control state.
+
+\subsection{The $W$-bit model}
+\label{sec:wbit}
+
+AArch64 registers are 64 bits wide, which would make every adder, multiplier and divider
+large. Our registers have $W$ bits, and a $W$-bit register represents the 64-bit (or 32-bit)
+value obtained by sign-extending it. For additions, logical operations, shifts, comparisons,
+multiplication and division of values of this form, the low $W$ bits of the AArch64 result,
+and the condition flags, are determined by the low $W$ bits of the operands. Whenever every
+value of a run has this form, the machine therefore reproduces the AArch64 execution exactly:
+the low $W$ bits of every register and memory cell, the NZCV flags and the control flow.
+Pointers are represented as offsets into code or data memory. The CPU reference checks this
+condition for every value written, read or compared during a run, and reports any value
+that does not fit (Section~\ref{sec:software}). A typical case that does not fit is division
+by a constant, which compilers turn into a multiplication by a 32-bit ``magic'' constant.
+
+\section{How the machine realises the von Neumann architecture}
+\label{sec:vonneumann}
+
+The defining features of a von Neumann (stored-program) computer are that the program is
+data held in the machine's memory, and that a fixed control unit runs a fetch, decode and
+execute cycle that interprets it. Our circuit has both:
+
+\begin{itemize}
+  \item \textbf{The program is state, not structure.} The circuit contains no gate that
+        depends on the program. Loading a different binary changes only the initial basis
+        state of the program-memory qubits. In our tests one circuit, built once, executes
+        hundreds of different random programs.
+  \item \textbf{Fetch, decode and execute are quantum operations.} The PC is a qubit
+        register; the instruction is selected by gates controlled by the PC qubits; the
+        decoder is a network of multi-controlled NOTs; branches compute the next PC in
+        qubits. No intermediate measurement, and no classical decision, occurs inside the
+        circuit.
+  \item \textbf{Control flow depends on data.} Conditional branches, loops and calls,
+        including returns through a register, are evaluated by the circuit from register
+        and flag qubits.
+\end{itemize}
+
+Program memory and data memory are separate qubit registers, so physically the organisation
+resembles a Harvard machine. Logically it is a stored-program machine: instructions are data
+in qubits, and the same circuit interprets any program. The program memory is read-only,
+which excludes self-modifying code.
+
+Because the construction is a Landauer embedding, it respects the theorem
+of~\cite{yuan2024qcm}: the history registers make the transition injective. For inputs in
+the computational basis---the case of an ordinary binary run with ordinary inputs---this is
+exactly what is needed. For inputs in superposition the history is entangled with the data;
+a computation of $f$ followed by a copy of the output and the inverse circuit removes it
+(Bennett's method), which gives a clean oracle $|x\rangle|0\rangle\mapsto|x\rangle|f(x)\rangle$.
+The coherence experiment in Section~\ref{sec:coherence} uses this structure.
+
+\section{Implemented instructions}
+\label{sec:isa}
+
+Table~\ref{tab:isa} lists the instructions the decoder implements, by class. The classes are
+(mask, value) patterns over the instruction word, and the same table drives the quantum
+decoder and the static support check of the loader, so a binary is reported as supported
+exactly when the circuit can decode every instruction it contains. Both 32-bit (W register)
+and 64-bit (X register) forms are implemented where they exist.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+group & instructions \\
+\midrule
+move & MOVZ, MOVN, MOVK and the MOV aliases \\
+arithmetic & ADD, ADDS, SUB, SUBS with immediate, shifted-register and extended-register operands; CMP, CMN, NEG \\
+logic & AND, ORR, EOR, ANDS, BIC, ORN, EON, BICS with register and bitmask-immediate operands; TST, MVN \\
+shifts, bitfields & LSL, LSR, ASR (immediate and register); UBFM, SBFM and their aliases UBFX, SBFX, UBFIZ, SBFIZ, UXTB/H, SXTB/H/W \\
+multiply, divide & MUL, MADD, MSUB, MNEG, SMULL, UMULL, SMADDL, UMADDL, SMSUBL, UMSUBL, SDIV, UDIV \\
+conditional & CSEL, CSINC, CSINV, CSNEG and the aliases CSET, CSETM, CINC, CNEG; CCMP, CCMN \\
+branches & B, B.cond, CBZ, CBNZ, TBZ, TBNZ, BL, BLR, BR, RET \\
+memory & LDR, STR (W and X), LDRSW with unsigned offset, unscaled offset (LDUR, STUR), pre-index, post-index and register offset (LSL, UXTW, SXTW); LDP, STP with offset, pre- and post-index \\
+addresses & ADRP (with ADD \texttt{:lo12:} for string literals and globals) \\
+other & NOP and hints; HLT ends the run \\
+\bottomrule
+\end{tabularx}
+\caption{AArch64 instructions implemented by the quantum decoder (27 classes).}
+\label{tab:isa}
+\end{table}
+
+Not implemented are byte and halfword loads and stores, rotations (ROR, RORV), bitfield
+insert (BFI, BFXIL), bit counting and reversal (CLZ, RBIT, REV), ADR, floating point, SIMD and
+system instructions. A binary that contains them can still run if it never reaches them; the
+report lists each one, and a run that reaches one halts with a trap. Table~\ref{tab:isa}
+covers the instructions that clang and gcc emit for typical integer C code at optimisation
+levels \texttt{-O0} to \texttt{-O2}: loops, arithmetic, comparisons, function calls with stack
+frames, local arrays, and string literals passed to \texttt{printf}.
+
+\section{Software structure}
+\label{sec:software}
+
+The implementation is a Python program, \texttt{arm\_qpu.py}, and a package \texttt{qcpu}
+\cite{armqpu}. Figure~\ref{fig:pipeline} shows the flow from a C source file to a result.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=5mm, every node/.style={font=\small},
+  box/.style={draw, rounded corners=2pt, minimum height=8mm, align=center, inner sep=3pt},
+  arr/.style={-{Stealth[length=2mm]}}]
+\node[box] (c) {C source};
+\node[box, right=of c] (o) {AArch64 object\\ (clang / gcc)};
+\node[box, right=of o] (l) {loader and linker\\ \texttt{loader.py}};
+\node[box, above right=2mm and 6mm of l] (q) {quantum machine\\ \texttt{machine.py}};
+\node[box, below right=2mm and 6mm of l] (r) {CPU reference\\ \texttt{reference.py}};
+\node[box, right=22mm of l] (cmp) {comparison,\\ output, report};
+\draw[arr] (c) -- (o); \draw[arr] (o) -- (l);
+\draw[arr] (l) -- (q); \draw[arr] (l) -- (r);
+\draw[arr] (q) -- (cmp); \draw[arr] (r) -- (cmp);
+\end{tikzpicture}
+\caption{From C source to a checked quantum run.}
+\label{fig:pipeline}
+\end{figure}
+
+\paragraph{Compilation.} The user compiles C with clang or gcc for AArch64 into an object
+file, for example \texttt{clang --target=aarch64-linux-gnu -O1 -c prog.c}. Both compilers,
+ELF objects, and arm64 Mach-O objects from Apple's toolchain are supported.
+
+\paragraph{Loader and linker} (\texttt{qcpu/loader.py}). The loader merges all executable
+sections into one code image and places the data sections (\texttt{.rodata}, \texttt{.data},
+\texttt{.bss}, string literals) in data memory. It applies the relocations a linker would:
+branches and calls (CALL26, JUMP26, BRANCH26), page addresses (ADR\_PREL\_PG\_HI21, PAGE21),
+page offsets (ADD\_ABS\_LO12\_NC, LDST$n$\_ABS\_LO12\_NC, PAGEOFF12) and absolute pointers in
+data (ABS64). Calls to \texttt{printf}, \texttt{puts} and \texttt{putchar} are bound to an
+output stub (Section~\ref{sec:printf}). The last program slot receives the \texttt{HLT}
+instruction, and the memory layout places the output log, the data sections, user data and
+the stack.
+
+\paragraph{Static check} (\texttt{qcpu/a64.py}). Every instruction word is classified by the
+same class table as the quantum decoder, with additional checks for unallocated and
+unimplemented sub-forms.
+
+\paragraph{Quantum machine} (\texttt{qcpu/machine.py}). The circuit generator emits the gate
+list of Section~\ref{sec:machine}. It decomposes multi-controlled NOTs into Toffoli chains with
+ancillas from a pool that is reused in every cycle, and it builds each functional unit out of
+place so that it can be uncomputed. The circuit can be exported to Qiskit~\cite{qiskit2024}.
+
+\paragraph{CPU reference and model check} (\texttt{qcpu/reference.py}). The same bytes run on
+the Unicorn emulator~\cite{unicorn}, which uses QEMU's ARM CPU core, one instruction at a
+time and with the same memory layout. The reference records the PC trace and checks every
+value against the $W$-bit model of Section~\ref{sec:wbit}, including flag-setting results
+that are discarded and every memory access.
+
+\paragraph{Simulation and backends} (\texttt{qcpu/bitsim.py}). Because the circuit uses only
+X, CNOT, Toffoli and Fredkin gates, it maps computational basis states to computational basis
+states, and a basis-state input can be simulated exactly by tracking bits. Every cycle is the
+same gate list; only its per-cycle registers are new qubits. The simulator therefore
+generates one cycle once and replays it $T$ times, resetting the per-cycle qubits and feeding
+in the previous cycle's PC, which is the same computation as the full circuit without
+storing $10^8$ gates. For inputs in superposition the circuit is run on Qiskit Aer, and an
+IBM Quantum backend is provided that checks the circuit's width against the device before
+submitting.
+
+\paragraph{Runner} (\texttt{arm\_qpu.py}). By default the runner prints only the program's
+own output and returns \texttt{main}'s return value as its exit code, as if the binary had
+been run locally. With \texttt{-v} it also prints the comparison with the CPU and the
+circuit's resources, and writes a report with the annotated disassembly, the instructions
+executed, the comparison of registers, flags, memory and PC trace, and the model check.
+
+\section{Program output: \texttt{printf}}
+\label{sec:printf}
+
+Printing is input/output, not computation, and on a quantum computer it raises a specific
+question: how can text leave a circuit that must stay coherent until the end? A system call
+that interrupts the circuit to print would require a measurement in the middle of the run.
+We instead treat output the way a hardware device does.
+
+\paragraph{Output stub.} The linker binds \texttt{printf}, \texttt{puts} and \texttt{putchar}
+to a stub of about twenty A64 instructions, which is listed in the repository
+(\texttt{docs/output\_stub.s}). The stub runs on the quantum machine like any other code. Each
+call appends one 32-byte record to an \emph{output log} at the start of data memory: the kind
+of call, the address of the format string, and the first six integer or pointer arguments.
+A counter at the start of the log is incremented, and calls beyond the log's capacity are
+dropped. On Apple's arm64 ABI, variadic arguments are passed on the stack; a variant of the
+stub loads them from there.
+
+\paragraph{Formatting on the host.} After the run, the output log is read from the final data
+memory, which is measured together with the rest of the machine state, and formatted on the
+host with the rules of C's \texttt{printf}. Format strings and \texttt{\%s} arguments are read
+from the program's constant data (\texttt{.rodata}). The CPU reference executes the same stub,
+so the host renders both machines' output and compares them.
+
+\paragraph{What runs where.} All computation runs on the quantum machine, including every value
+that is printed, the decision of what to print and when, and the order of the calls. Only the
+conversion of the logged values into characters happens classically, after the final
+measurement. The program is unaware of this: it includes \texttt{<stdio.h>} (a minimal header
+is provided, so no system headers or C library are needed) and calls \texttt{printf} as usual.
+Compilers turn \texttt{printf("text\textbackslash n")} into \texttt{puts}, which is why the
+stub also covers \texttt{puts} and \texttt{putchar}.
+
+\paragraph{Limits.} Integers and pointers are supported, floating point is not; up to six
+arguments per call; \texttt{\%s} works for constant strings, not for text built in memory at run
+time (byte loads are not implemented); and the log holds a configurable number of calls
+(32 by default).
+
+Listing~\ref{lst:hello} shows a complete program, and how it is compiled and run.
+
+\begin{lstlisting}[language=C,caption={A C program and its run on the quantum machine.},label={lst:hello}]
+#include <stdio.h>
+
+int smallest_factor(int n) {
+    for (int d = 2; d * d <= n; d++)
+        if (n % d == 0) return d;
+    return n;
+}
+
+int main(void) {
+    int n = 84;
+    printf("Hello from the QPU!\n");
+    printf("%d =", n);
+    while (n > 1) {
+        int p = smallest_factor(n);
+        printf(" %d", p);
+        n /= p;
+    }
+    printf("\n");
+    return 0;
+}
+\end{lstlisting}
+\begin{lstlisting}[language={}]
+$ clang --target=aarch64-linux-gnu -O1 -fno-stack-protector \
+        -Iinclude -c hello.c -o hello.o
+$ python3 arm_qpu.py hello.o
+Hello from the QPU!
+84 = 2 2 3 7
+\end{lstlisting}
+
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Method}
+
+Every run is checked against the CPU reference. A run is reported as a match when all of the
+following agree between the quantum machine and the CPU: the low $W$ bits of every
+instantiated register and of every data-memory cell, the NZCV flags, the PC at every cycle,
+halting without a trap, and, for programs that print, the rendered output text. The circuit
+is simulated exactly on its basis-state input.
+
+\subsection{C programs}
+
+The test suite compiles C programs with clang and with gcc at \texttt{-O0}, \texttt{-O1} and
+\texttt{-O2}. It runs 16 function-level cases (trial-division factorization, gcd, Fibonacci,
+primality, popcount, Collatz steps, integer square root, modular exponentiation, maximum of
+three, function calls, bubble sort in memory, binary search, digit sum) and three whole
+programs whose \texttt{main} prints its results with \texttt{printf}. Of the 54 runs per compiler,
+all match the CPU, except the digit-sum function, in which the compiler replaces division by
+10 with a multiplication by a 32-bit constant (with clang at \texttt{-O1} and \texttt{-O2}, with
+gcc at every level). The model check flags these runs, as required: their intermediate values
+do not fit the $W$-bit model.
+
+Table~\ref{tab:res} lists the resources of the example programs, compiled with clang
+\texttt{-O1}. The qubit and gate counts are those of the full circuit; ``cycles'' is the number
+of machine cycles $T$.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+program & instructions & cycles & $W$ & qubits & gates & Toffoli \\
+\midrule
+coherence test (Sec.~\ref{sec:coherence}) & 3 & 4 & 8 & 418 & 7\,448 & 4\,880 \\
+\texttt{factorize(84)}, one function & 227 & 72 & 12 & 179\,448 & $3.06\times10^{7}$ & $1.95\times10^{7}$ \\
+\texttt{hello.c} (Listing~\ref{lst:hello}) & 84 & 221 & 12 & 504\,168 & $8.89\times10^{7}$ & $5.60\times10^{7}$ \\
+\texttt{algorithms.c}, 7 results & 336 & 489 & 12 & 1\,110\,264 & $2.28\times10^{8}$ & $1.48\times10^{8}$ \\
+\texttt{factor.c}, 3 factorizations & 227 & 592 & 12 & 1\,334\,888 & $2.51\times10^{8}$ & $1.60\times10^{8}$ \\
+\bottomrule
+\end{tabular}
+\caption{Resources of the example programs (clang \texttt{-O1}). ``Instructions'' counts the
+linked code image, including the output stub; the coherence test runs on a machine whose
+decoder implements only the four classes its program uses.}
+\label{tab:res}
+\end{table}
+
+A full machine cycle with all 27 instruction classes, 64 to 512 program slots and data memory
+costs roughly $4\times10^{5}$ gates. Its largest parts are the program-memory and data-memory
+multiplexers, whose cost grows linearly with the memory sizes, and the divider. The exact
+simulation of the largest example takes about 20 seconds on one CPU core.
+
+\subsection{Differential fuzzing}
+
+A fuzzer generates random A64 programs of 4 to 13 instructions drawn from all implemented
+classes, with forward branches, calls, loads and stores, random register values and random
+memory contents. It assembles them with clang and runs them on one fixed interpreter circuit
+and on the CPU reference, comparing registers, flags, memory and the full PC trace. Programs
+whose values leave the $W$-bit model, or that access memory outside the data region, are
+discarded by the reference. Across the fuzzing runs on the final machine, about 400 programs
+were compared, with no discrepancy.
+
+\subsection{Coherence}
+\label{sec:coherence}
+
+The previous results use basis-state inputs, for which a reversible classical simulation
+would give the same outcome. To show that the circuit is a coherent quantum computation, we
+run the program \texttt{movz w0,\#5; add w0,w0,\#3; ret} on Qiskit Aer with the
+matrix-product-state method. Bit 5 of the first instruction word is bit 0 of the immediate,
+so flipping it turns \texttt{\#5} into \texttt{\#4}. We apply a Hadamard gate to that
+program-memory qubit before the machine runs.
+
+\begin{enumerate}
+  \item \textbf{Superposed program.} Measuring X0 after the run gives 8 or 7, with frequencies
+        1010 and 990 out of 2000 shots: one run executed both programs.
+  \item \textbf{Interference.} We apply $H$ to the qubit, the machine $U$, a phase $Z$ on bit 0
+        of X0, the inverse machine $U^{-1}$ and $H$ again, then measure the qubit. Without the
+        phase the outcome is 1 in all 2000 shots; with the phase it is 0 in all 2000 shots.
+\end{enumerate}
+
+The phase is applied to a register that depends on which program ran, so the deterministic,
+flipped outcome in the second experiment requires that the two program branches interfere.
+That can only happen if fetch, decode and execution are coherent: a measurement or a
+classically controlled step anywhere inside $U$ would destroy the interference and produce
+50/50 outcomes. This is also an instance of Bennett's compute--phase--uncompute pattern of
+Section~\ref{sec:vonneumann}, which turns the program into a phase oracle.
+
+\section{Discussion}
+
+\paragraph{Cost.} The machine is extremely expensive. Each cycle re-reads the entire program
+memory and data memory through multiplexers, keeps $O(W)$ history qubits per write, and
+contains a multiplier and a divider even when the instruction is a move. A short C program
+needs hundreds of thousands to more than a million qubits and up to $1.6\times10^{8}$ Toffoli
+gates. Current devices offer on the order of a hundred to a few thousand noisy physical
+qubits, so a hardware run of anything but a few-instruction program on a heavily reduced
+machine profile is out of reach until large fault-tolerant machines exist.
+
+\paragraph{No advantage.} A classical program executed this way gains nothing from being on a
+quantum computer: on basis-state inputs it computes exactly what a CPU computes, many orders
+of magnitude more slowly. The interest of the construction lies elsewhere. It shows concretely
+that the stored-program model and real machine code can be carried by a quantum computer, it
+provides a test bed for quantum control flow on a real instruction set, and, combined with
+Bennett's method, it turns ordinary compiled code into reversible oracles whose correctness is
+checked against a real CPU. Such oracles are needed by quantum algorithms that evaluate a
+classical function in superposition, and by resource estimates for them~\cite{grassl2016aes,amy2016sha}.
+
+\paragraph{Towards efficiency.} The interpreter can be specialised to a fixed program by
+partial evaluation~\cite{futamura1971}, which removes fetch and decode and leaves a compiled
+reversible circuit for that program. The history-free control flow of~\cite{yuan2024qcm} and
+the synchronisation of~\cite{zhang2025qrm} point to how branching on quantum data could be
+added to the instruction set. A hybrid design that keeps the PC classical wherever control
+depends only on classical data would reduce the cost by orders of magnitude.
+
+\paragraph{Limitations.} The register width $W\le16$ limits values to small integers; the
+instruction subset excludes byte memory access and floating point; program memory is
+read-only; and output is limited to \texttt{printf}-style records formatted after the run.
+
+\section{Conclusion}
+
+We built a quantum circuit that is a complete stored-program computer for a substantial subset
+of AArch64, and showed that it runs ordinary C programs compiled by clang and gcc---loops,
+function calls, arrays and \texttt{printf}---with results identical to an ARM CPU, and that it
+executes a superposition of programs coherently. The construction is inefficient and gives no
+speed-up, but it demonstrates that a quantum computer can run ARM code and implement the von
+Neumann architecture. All code, examples and tests are available at
+\url{https://github.com/quantag/arm-qpu}~\cite{armqpu}.
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\end{document}
