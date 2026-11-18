@@ -1,54 +1,185 @@
-# arm-qpu — the same ARM64 machine code on a CPU and on a quantum stored-program processor
+# arm-qpu: run an ARM64 binary on a quantum computer
 
-The same raw AArch64 (A64) instruction bytes, produced by a standard assembler (clang), are executed:
+`arm_qpu.py` takes an AArch64 binary compiled from C (or any language), runs it on a
+**quantum stored-program (von Neumann) processor** made entirely of quantum gates, runs the
+same bytes on an ARM CPU emulator, and writes a report comparing the two.
 
-1. on a conventional ARM64 CPU (Unicorn/QEMU emulator here, or a real ARM machine via `tools/make_harness.py`), and
-2. on a **quantum von Neumann interpreter**: one fixed quantum circuit with program memory, a program counter, fetch, decode, register file, ALU and write-back, all made of quantum gates.
+The quantum processor is **one fixed reversible circuit** (X, CNOT, Toffoli, Fredkin gates).
+It has program memory, a program counter, fetch, a decoder for 32 A64 instruction classes,
+31 registers + SP, NZCV flags, data memory with a stack, an ALU (adder, barrel shifter,
+multiplier, divider, bitmask decoder), and a branch unit with calls and returns.
+The binary is **not compiled into the circuit**: its 32-bit instruction words are loaded as
+the initial state of the program-memory qubits. Nothing inside the circuit is measured or
+classically dispatched.
 
-The program is **not** compiled into the circuit. Its 32-bit instruction words are loaded as the initial basis state of the program-memory qubits. The same circuit (its SHA-256 is printed by the tests) runs different programs. Nothing inside it is measured or classically dispatched.
+## Quick start: factorization in C
 
-## Status (simulation)
+`examples/factor.c`:
 
-| Test | Result |
-|---|---|
-| `MOVZ X0,#5; ADD X1,X0,#3; EOR X2,X0,X1` | CPU = QPU-sim = Aer = `X0=5, X1=8, X2=13` |
-| Second program (`MOVZ X2,#9; EOR X1,X2,X2; ADD X2,X2,#4`), same circuit | match |
-| 300 random 4-instruction programs (random regs/immediates) | 300/300 match, all scratch qubits returned to \|0⟩ |
-| Program in superposition (`MOVZ X0,#5` and `#4` at once) | outputs `(5,8)` and `(4,7)`, entangled, ~50/50 |
-| Interference test (H, U, Z, U†, H) | deterministic flip, which proves the execution is coherent |
+```c
+int smallest_factor(int n) {
+    for (int d = 2; d * d <= n; d++)
+        if (n % d == 0)
+            return d;
+    return n;
+}
 
-Not yet run on physical QPU hardware.
+int factorize(int n, int *out) {          /* writes the prime factors to out[] */
+    int k = 0;
+    while (n > 1) {
+        int p = smallest_factor(n);
+        out[k++] = p;
+        n /= p;
+    }
+    return k;
+}
+```
 
-## Scope (honest claim boundary)
+Compile it to an AArch64 object file (any of these):
 
-* Supported encodings: `MOVZ Xd,#imm16` (hw=0), `ADD Xd,Xn,#imm12` (sh=0), `EOR Xd,Xn,Xm` (no shift); registers X0..X3.
-* Registers are W bits wide (default 4). For these instructions the low W bits of the 64-bit ARM result depend only on the low W bits of the operands. So the machine computes **exactly bits [W-1:0]** of the real AArch64 result. That is a restricted model, not full AArch64.
-* The program length is fixed when the interpreter is built (no branches yet).
-* Register overwrite is made reversible by a controlled-SWAP into a per-step history register.
+```bash
+# Linux / any OS with clang (cross-compiles, no ARM machine needed)
+clang --target=aarch64-linux-gnu -O1 -c examples/factor.c -o factor.o
 
-## Resources (`python3 tools/resources.py`)
+# macOS on Apple Silicon (native arm64 Mach-O)
+clang -O1 -c examples/factor.c -o factor.o
 
-| Configuration | Qubits | CZ gates (all-to-all, before routing) |
-|---|---|---|
-| Full decoder, 4 regs, 3 instructions | 207 | ~11 000 |
-| Minimal decoder, 4 regs, 3 instructions | 117 | ~6 600 |
-| Minimal decoder, 2 regs, MOVZ+ADD, 2 instructions (hardware target) | 66 | ~1 450 |
+# GCC cross toolchain
+aarch64-linux-gnu-gcc -O1 -c examples/factor.c -o factor.o
+```
 
-The "minimal decoder" stores only the instruction bits the decoder reads. The classical loader checks first that every word is a supported encoding.
-
-## Run
+Run it on the QPU (`&0` = pointer to data-memory cell 0, where the factors are written):
 
 ```bash
 pip install -r requirements.txt
-python3 -m tests.test_equivalence --aer   # CPU vs quantum interpreter
-python3 -m tests.test_fuzz 300            # random programs (needs clang + llvm-objcopy)
-python3 -m tests.test_coherence           # superposition / interference
-python3 tools/resources.py
-
-# on a real ARM64 machine (e.g. Apple Silicon Mac):
-python3 tools/make_harness.py arm/prog1.bin > harness.c && cc harness.c -o harness && ./harness
+python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
 ```
 
-## Layout
+```
+MATCH: the QPU produced the same result as the CPU
+return value X0: CPU = 4, QPU = 4
+quantum machine: 26903 qubits, 4616376 gates (2564408 Toffoli), 92 steps
+report: factor.factorize.report.md
+```
 
-`arm/` sources, `.o` and raw `.text` `.bin` · `qcpu/machine.py` quantum interpreter · `qcpu/bitsim.py` exact basis-state simulator · `tools/reference.py` CPU reference · `tests/`
+The report shows data memory `[2, 2, 3, 7, ...]` on both machines, identical registers,
+flags and step-by-step PC trace, the disassembly with every instruction marked supported or
+not, and the circuit's resources.
+
+Options: `--entry FUNC` (default `main`, else the first function), `--args` for X0, X1, ...
+(`&k` = pointer to data cell k), `--mem=1,2,3` to initialise data memory (32-bit cells),
+`--config config.json`, `--report PREFIX`.
+
+## config.json
+
+```json
+{
+  "backend": "simulator",
+  "register_width": "auto",
+  "registers": "auto",
+  "memory_words": "auto",
+  "max_steps": "auto",
+  "isa": "full",
+  "shots": 1024,
+  "aer": {"method": "matrix_product_state"},
+  "ibm": {"channel": "ibm_quantum_platform", "token": "env:IBM_QUANTUM_TOKEN",
+          "instance": null, "backend": "least_busy", "optimization_level": 1}
+}
+```
+
+| key | meaning |
+|---|---|
+| `backend` | `simulator`: exact simulation of the circuit on its basis-state input (fast, any size). `aer`: Qiskit Aer, sampled with `shots`. `ibm`: IBM Quantum hardware through Qiskit Runtime (`token` may be `env:VAR`). |
+| `register_width` | W, bits per register (8 to 16). `auto` = smallest W that holds the code addresses. |
+| `registers` | `auto` = only registers the code uses; `all` = X0..X30; or a list. |
+| `memory_words` | data memory in 4-byte cells; `auto` = 2^(W-4) if the code touches memory. |
+| `max_steps` | machine cycles in the circuit; `auto` = what the CPU reference needed. |
+| `isa` | `full` = decoder implements every supported class; `auto` = only the classes the program uses (smaller circuit). |
+
+Before submitting to hardware the runner checks the circuit's width against the device. A run
+that does not fit is reported as not submitted, with the reason.
+
+## What is implemented
+
+| group | instructions |
+|---|---|
+| move | MOVZ, MOVN, MOVK, MOV (all aliases) |
+| arithmetic | ADD, ADDS, SUB, SUBS (immediate, shifted register, extended register), CMP, CMN, NEG |
+| logic | AND, ORR, EOR, ANDS, BIC, ORN, EON, BICS (register and bitmask immediate), TST, MVN |
+| shifts / bitfields | LSL, LSR, ASR (immediate and register), UBFM, SBFM, UBFX, SBFX, UBFIZ, SBFIZ, UXTB/H, SXTB/H/W |
+| multiply / divide | MUL, MADD, MSUB, MNEG, SMULL, UMULL, SMADDL, UMADDL, SDIV, UDIV |
+| conditional | CSEL, CSINC, CSINV, CSNEG, CSET, CSETM, CINC, CNEG, CCMP, CCMN |
+| branches | B, B.cond, CBZ, CBNZ, TBZ, TBNZ, BL, BLR, BR, RET |
+| memory | LDR, STR, LDRSW (unsigned offset, unscaled LDUR/STUR, pre-index, post-index, register offset with LSL/UXTW/SXTW), LDP, STP (offset, pre-, post-index) |
+| other | NOP and hints; HLT ends the run |
+
+Anything else (byte/halfword loads, ROR, BFI/BFXIL, CLZ/REV, ADR/ADRP, floating point, SIMD,
+system instructions) is listed in the report's "Unsupported instructions" table. A run that
+reaches one stops with a trap; the CPU reference reports it first.
+
+## The W-bit model, and when results are exact
+
+The quantum registers are W bits wide. A W-bit register stands for the 64-bit (or 32-bit)
+value you get by sign-extending it. When every value of a run has that form, the quantum
+machine reproduces the AArch64 result exactly: the low W bits of every register and memory
+cell, the NZCV flags, and the control flow.
+
+The CPU reference checks every value of the run and lists any that does not fit in the
+report's "Model check" section. Example: at `-O1`, clang compiles `n / 10` as a multiply by
+`0xCCCCCCCD` and a 35-bit shift. Those values cannot fit in W ≤ 16, so the report flags them.
+The same function at `-O0` (a real `sdiv`) matches.
+
+Code addresses are `4 × slot` and data pointers are offsets into data memory. Both must be
+non-negative W-bit values, which is why `register_width: auto` grows W with program size.
+
+## Tests
+
+```bash
+python3 -m tests.test_c_programs    # 16 C cases x -O0/-O1/-O2 through arm_qpu.py (examples/*.c)
+python3 -m tests.test_fuzz 500      # random A64 programs: one circuit, CPU vs QPU, regs/flags/memory/trace
+```
+
+`test_c_programs` covers factorization, gcd, Fibonacci, primality, popcount, Collatz, integer
+square root, modular exponentiation, max3, function calls, bubble sort (in memory) and binary
+search. Every case matches the CPU, except the two flagged `digit_sum` cases described above.
+
+## How the quantum machine works
+
+One machine cycle is a reversible block:
+
+1. **Fetch.** IR ^= MEM[PC], with each program slot selected by a comparator on the PC qubits.
+2. **Decode.** One-hot class flags from IR bit patterns, all gated by a `running` qubit.
+3. **Execute.** Register-file reads are multiplexers on the Rn/Rm/Rt fields. Then the ALU:
+   ripple adder with flags, barrel shifter, shift-add multiplier, restoring divider, logical
+   bitmask decoder, condition evaluation, and address generation.
+4. **Copy out, then uncompute.** The cycle's results are copied into fresh per-step
+   registers, and the whole compute block runs backwards, so every scratch qubit returns to |0⟩.
+5. **Commit.** Controlled-SWAPs move the results into registers, flags, memory and PC. The
+   displaced old values stay behind as history, which makes overwrites and jumps unitary
+   (Landauer/Bennett embedding). The PC history doubles as an execution trace.
+
+After `HLT` (the return address the entry function starts with), the remaining cycles are
+no-ops. That is the synchronisation the Quantum Control Machine paper requires.
+
+Code: `qcpu/machine.py` (circuit), `qcpu/a64.py` (instruction classes and static check),
+`qcpu/reference.py` (CPU reference and model check), `qcpu/loader.py` (ELF/Mach-O with BL
+relocations), `qcpu/bitsim.py` (exact simulator), `arm_qpu.py` (CLI and reports).
+
+## Honest status
+
+* Simulation: verified as above.
+* Hardware: the backend is implemented, but the circuits are far larger than today's devices.
+  The smallest real program (`subs; cneg; ret`, `isa: auto`) needs 666 qubits and about 9 000
+  Toffoli gates; factorization needs about 27 000 qubits. Running on a QPU means a much smaller
+  machine profile, or fault-tolerant hardware.
+* There is no speed-up: a classical program on a QPU is a very expensive reversible computer.
+  The value is a verified bridge from ordinary binaries to quantum circuits: reversible oracles,
+  resource estimation, and a quantum control-flow test bed. See `docs/prior_work.md` and the
+  QA64 roadmap there.
+
+## Prior work
+
+* Mariantoni et al., *Implementing the quantum von Neumann architecture with superconducting circuits*, Science 2011: quantum CPU and memory, instructions classical.
+* Fitzjohn et al., Qx86 (Intel 8080/Z80 on IBM Q), IEEE TQE 2022 / QIP 2024: the PC and fetch/decode are classical; each instruction runs as a separate quantum job.
+* Yuan, Villanyi, Carbin, *Quantum Control Machine*, OOPSLA 2024: limits of control flow in superposition (injectivity, synchronisation).
+* Zhang, Ying, *Quantum Register Machine*, PLDI 2025: an ISA with a quantum PC, qif/fiq and recursion; no public implementation.

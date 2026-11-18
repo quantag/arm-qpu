@@ -1,28 +1,31 @@
-"""Fast exact simulator for reversible circuits on computational-basis states.
-The interpreter uses only X/CX/CCX/MCX/CSWAP, i.e. a permutation of basis states,
-so a basis input maps to a single basis output and can be tracked bit by bit."""
+"""Exact simulator for the interpreter circuit on computational-basis inputs.
+
+The circuit uses only X / CX / CCX / CSWAP, i.e. it is a permutation of basis states, so a
+basis input maps to exactly one basis output; tracking bits is an exact simulation of the
+quantum circuit for such inputs (superposed inputs need Aer or hardware)."""
 
 
-def simulate_basis(qc, bits=None):
-    idx = {q: i for i, q in enumerate(qc.qubits)}
-    s = [0] * qc.num_qubits if bits is None else list(bits)
-    for inst in qc.data:
-        name, qs = inst.operation.name, [idx[q] for q in inst.qubits]
-        if name == "x":
-            s[qs[0]] ^= 1
-        elif name in ("cx", "ccx", "mcx"):
-            if all(s[q] for q in qs[:-1]):
-                s[qs[-1]] ^= 1
-        elif name == "cswap":
-            if s[qs[0]]:
-                s[qs[1]], s[qs[2]] = s[qs[2]], s[qs[1]]
-        elif name == "barrier":
-            pass
+def simulate(gates, n, ones=()):
+    s = bytearray(n)
+    for q in ones:
+        s[q] ^= 1
+    for g in gates:
+        op = g[0]
+        if op == "ccx":
+            if s[g[1]] and s[g[2]]:
+                s[g[3]] ^= 1
+        elif op == "cx":
+            if s[g[1]]:
+                s[g[2]] ^= 1
+        elif op == "x":
+            s[g[1]] ^= 1
+        elif op == "cswap":
+            if s[g[1]]:
+                s[g[2]], s[g[3]] = s[g[3]], s[g[2]]
         else:
-            raise ValueError(f"non-permutation gate {name}")
+            raise ValueError(op)
     return s
 
 
-def read_reg(qc, bits, reg):
-    idx = {q: i for i, q in enumerate(qc.qubits)}
-    return sum(bits[idx[q]] << j for j, q in enumerate(reg))
+def value(state, qubits):
+    return sum(state[q] << i for i, q in enumerate(qubits))
