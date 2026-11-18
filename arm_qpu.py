@@ -49,8 +49,15 @@ GCC_NAMES = ["aarch64-linux-gnu-gcc", "aarch64-none-linux-gnu-gcc", "aarch64-non
 
 def find_compiler(choice):
     """Return the command prefix that compiles C to an AArch64 object file."""
-    if choice in ("auto", "clang") and shutil.which("clang"):
-        return ["clang", "--target=aarch64-linux-gnu"]
+    clang = shutil.which("clang")
+    if not clang and os.name == "nt":        # LLVM's Windows installer does not add itself to PATH
+        for d in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", "")):
+            cand = os.path.join(d, "LLVM", "bin", "clang.exe")
+            if d and os.path.exists(cand):
+                clang = cand
+                break
+    if choice in ("auto", "clang") and clang:
+        return [clang, "--target=aarch64-linux-gnu"]
     if choice in ("auto", "gcc"):
         for name in GCC_NAMES:
             if shutil.which(name):

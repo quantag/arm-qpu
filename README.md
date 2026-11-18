@@ -137,7 +137,10 @@ On Fedora: `sudo dnf install clang llvm gcc-aarch64-linux-gnu python3 git`. On A
 winget install -e --id Python.Python.3.12
 winget install -e --id Git.Git
 winget install -e --id LLVM.LLVM
-# open a NEW PowerShell window so PATH picks up python, git and clang
+# the LLVM installer does not add itself to PATH: add it (current window + permanently)
+$env:Path += ";C:\Program Files\LLVM\bin"
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\Program Files\LLVM\bin", "User")
+clang --version            # must print a version; if not, open a NEW PowerShell window
 
 # 2. get the code and its Python packages
 git clone https://github.com/quantag/arm-qpu.git
