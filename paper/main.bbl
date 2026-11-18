@@ -107,7 +107,7 @@ Matthew Amy, Martin Roetteler, and Krysta~M. Svore.
   Lecture Notes in Computer Science}, pages 3--21. Springer, 2017.
 
 \bibitem{armqpu}
-{Quantag}.
+Sergii Salata.
 \newblock arm-qpu: running {ARM64} binaries on a quantum stored-program
   computer.
 \newblock \url{https://github.com/quantag/arm-qpu}, 2026.
