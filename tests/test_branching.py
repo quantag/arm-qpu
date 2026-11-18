@@ -16,6 +16,7 @@ x is bit 0 of X0, put in superposition with a Hadamard gate.
   C) the same without U^-1: H U Z H -> 50/50. The branches stay entangled with their histories
      (the per-cycle PC and register history), as the Quantum Control Machine theorem predicts.
 Run: python3 -m tests.test_branching"""
+SEED = 2026          # Aer seed_simulator: the shot counts below are reproducible
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qiskit import ClassicalRegister, QuantumCircuit
@@ -47,7 +48,7 @@ if __name__ == "__main__":
     qc.measure(x, c[0])
     for i in range(8): qc.measure(m.X[2][i], c[1 + i])
     qc.measure(m.run[3], c[9])                    # running after cycle 3?
-    counts = sim.run(qc, shots=2000).result().get_counts()
+    counts = sim.run(qc, shots=2000, seed_simulator=SEED).result().get_counts()
     seen = {}
     for k, n in counts.items():
         b = int(k, 2)
@@ -61,7 +62,7 @@ if __name__ == "__main__":
         if uncompute: qc = qc.compose(U.inverse())
         qc.h(x)
         cr = ClassicalRegister(1, "b"); qc.add_register(cr); qc.measure(x, cr)
-        return sim.run(qc, shots=2000).result().get_counts()
+        return sim.run(qc, shots=2000, seed_simulator=SEED).result().get_counts()
     a, b = interfere(False), interfere(True)
     print("B) after uncompute, without phase:", a, " with phase on X2[1]:", b)
     assert len(a) == 1 and len(b) == 1 and set(a) != set(b)

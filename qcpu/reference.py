@@ -76,6 +76,21 @@ def _flag_result(w, cls, reg, nzcv):
     return ((rn - b) if sub else (rn + b)) & m, ds, b
 
 
+def _nzcv(w, cls, a, b, ds):
+    """NZCV of a flag-setting instruction with ds-bit operands a (Rn) and b (second operand)."""
+    m, top = (1 << ds) - 1, 1 << (ds - 1)
+    if cls.startswith("logic"):
+        r = a & b
+        return ((r & top) and 8) | ((r == 0) and 4)
+    sub = bits(w, 30, 1)
+    bb = (~b & m) if sub else b
+    full = a + bb + sub
+    r = full & m
+    c = full >> ds
+    v = ((a ^ r) & (bb ^ r) & top) != 0
+    return ((r & top) and 8) | ((r == 0) and 4) | (c << 1) | v
+
+
 def read_width(w, cls, r, ds):
     """Width at which instruction w reads register r."""
     if cls in MEMOPS:
@@ -131,6 +146,14 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
                           "memory, unaligned, or not a 32/64-bit access")
     mu.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, on_mem)
 
+    def plain(v, ds):
+        view = v & ((1 << ds) - 1)
+        return _sext(view & mask, W) % (1 << ds) == view
+
+    def enc(v):
+        """The value the W-bit machine holds for v, as 64-bit: sign extension of its low W bits."""
+        return _sext(v & mask, W) % (1 << 64)
+
     def fits(v, ds):
         view = v & ((1 << ds) - 1)
         if _sext(view & mask, W) % (1 << ds) == view:
@@ -154,6 +177,7 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
                               mem=bytes(mu.mem_read(DATA_BASE, 4 * mem_words)) if mem_words else b""))
     pc = CODE_BASE + 4 * entry
     halted, error = False, None
+    pending_flags = None
     for step in range(max_steps):
         step_ref[0] = step
         idx = (pc - CODE_BASE) // 4
@@ -178,6 +202,33 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
             if not fits(v, rw):
                 issues.append(f"step {step} (instr {idx}): {rw}-bit read of {'SP' if r == 31 else 'X%d' % r}"
                               f" = 0x{v:x} does not fit the {W}-bit model")
+        # pointers are held as their offset; operations that depend on the bits above the encoding
+        # are exact only if they give the same outcome on the encoding as on the real pointer
+        ptrs = [r for r in chk.reads if not plain(reg(r, True), read_width(w, chk.cls, r, ds))]
+        if ptrs:
+            highbit = chk.cls in ("div", "maddl", "bfm", "shiftv") or \
+                chk.cls in ("addsub_reg", "logic_reg") and bits(w, 16, 5) in ptrs and bits(w, 22, 2) and bits(w, 10, 6)
+            if highbit:
+                issues.append(f"step {step} (instr {idx}): pointer X{ptrs[0]} is used by an operation that depends "
+                              "on bits above its W-bit encoding")
+            if chk.cls in ("cbz", "tbz"):
+                v = reg(bits(w, 0, 5), False)
+                if chk.cls == "cbz":
+                    m_ = (1 << ds) - 1
+                    same = ((v & m_) == 0) == ((enc(v) & m_) == 0)
+                else:
+                    b_ = bits(w, 31, 1) << 5 | bits(w, 19, 5)
+                    same = (v >> b_ & 1) == (enc(v) >> b_ & 1)
+                if not same:
+                    issues.append(f"step {step} (instr {idx}): {chk.cls.upper()} on pointer X{bits(w, 0, 5)} = 0x{v:x} "
+                                  "takes a different branch on its W-bit encoding (e.g. a pointer encoded as 0)")
+            _, fds, fb = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
+            if fb is not None:
+                er = lambda r, sp: enc(reg(r, sp))
+                _, _, eb = _flag_result(w, chk.cls, er, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
+                fm = (1 << fds) - 1
+                rn = reg(bits(w, 5, 5), chk.cls in ("addsub_imm", "addsub_ext")) & fm
+                pending_flags = (_nzcv(w, chk.cls, enc(rn) & fm, eb, fds), step, idx)
         res, rds, op2 = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
         if res is not None and not fits(res, rds):
             issues.append(f"step {step} (instr {idx}): flag-setting result 0x{res:x} does not fit the {W}-bit model")
@@ -189,6 +240,10 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
             error = f"CPU exception at instruction {idx}: {e}"
             break
         pc = mu.reg_read(A.UC_ARM64_REG_PC)
+        if pending_flags is not None:
+            if pending_flags[0] != mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28:
+                issues.append(f"step {step} (instr {idx}): flags computed on pointer encodings differ from the CPU")
+            pending_flags = None
         snap()
         for r in chk.writes:
             v = reg(r, True)

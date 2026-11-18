@@ -59,6 +59,18 @@ def cases(W):
             out.append(("mul/div", ["sdiv w2, w0, w1", "udiv w3, w0, w1", "sdiv x4, x0, x1", "udiv x5, x0, x1"], [a, b]))
         out.append(("bitfield", ["ubfx w1, w0, #3, #4", "sbfx w2, w0, #2, #5", "ubfiz w3, w0, #4, #3", "sbfiz x4, x0, #1, #6",
                                  "sxtb w5, w0", "uxth w6, w0"], [a]))
+    # 7. pointers (held as their offset from DATA_BASE): NULL tests, compares, high-bit operations.
+    #    X7 = DATA_BASE is encoded as 0, so a NULL test on it must be flagged, not silently wrong.
+    for k in (0, 4, -4, 8):
+        pre = [f"add x7, x7, #{k}" if k >= 0 else f"sub x7, x7, #{-k}"]
+        for body in (["cbz x7, 1f", "mov w1, #1", "1:"], ["cbnz x7, 1f", "mov w1, #1", "1:"],
+                     ["tbnz x7, #28, 1f", "mov w1, #1", "1:"], ["tbz x7, #2, 1f", "mov w1, #1", "1:"],
+                     ["cmp x7, #0", "cset w1, eq", "cset w2, lt", "cset w3, hi"],
+                     ["add x6, x7, #8", "cmp x6, x7", "cset w1, hi", "cset w2, eq", "cset w3, lt"],
+                     ["sub x6, x7, #4", "cmp x7, x6", "cset w1, hs", "cset w2, gt"],
+                     ["tst x7, #7", "cset w1, eq"], ["lsr x1, x7, #2"], ["mov x2, #3", "udiv x1, x7, x2"],
+                     ["add x1, x7, #12", "sub x2, x1, x7", "str x1, [x7, #16]", "ldr x3, [x7, #16]"]):
+            out.append(("pointer", pre + body, [0] * 7))
     return out
 
 

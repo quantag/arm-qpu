@@ -59,7 +59,7 @@ def aer_vs_fast():
         cr = ClassicalRegister(24, "r"); qc.add_register(cr)
         for j, k in enumerate((0, 1, 2)):
             for i in range(8): qc.measure(m.X[k][i], cr[8 * j + i])
-        counts = AerSimulator(method="matrix_product_state").run(qc, shots=32).result().get_counts()
+        counts = AerSimulator(method="matrix_product_state").run(qc, shots=32, seed_simulator=2026).result().get_counts()
         assert len(counts) == 1, counts
         b = int(next(iter(counts)), 2)
         got = [(b >> (8 * j)) & 255 for j in range(3)]

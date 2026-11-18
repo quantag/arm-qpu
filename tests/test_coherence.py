@@ -8,6 +8,7 @@ Program (clang-assembled A64):  movz w0, #5 ; add w0, w0, #3 ; ret
    and opposite to the same circuit without Z. A machine that measured or classically
    dispatched anything inside U would give 50/50 instead.
 Run: python3 -m tests.test_coherence"""
+SEED = 2026          # Aer seed_simulator: the shot counts below are reproducible
 import os, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qiskit import ClassicalRegister, QuantumCircuit
@@ -38,7 +39,7 @@ def prep():
 
 qc = prep().compose(U)
 cr = ClassicalRegister(8, "x0"); qc.add_register(cr); qc.measure(m.X[0], cr)
-counts = sim.run(qc, shots=2000).result().get_counts()
+counts = sim.run(qc, shots=2000, seed_simulator=SEED).result().get_counts()
 dist = {int(k, 2): v for k, v in counts.items()}
 print("1) superposed program -> X0:", dist)
 assert set(dist) == {7, 8}
@@ -49,7 +50,7 @@ def interfere(with_z):
     if with_z: qc.z(m.X[0][0])
     qc = qc.compose(U.inverse()); qc.h(bit)
     cr = ClassicalRegister(1, "b"); qc.add_register(cr); qc.measure(bit, cr)
-    return sim.run(qc, shots=2000).result().get_counts()
+    return sim.run(qc, shots=2000, seed_simulator=SEED).result().get_counts()
 
 
 a, b = interfere(False), interfere(True)
