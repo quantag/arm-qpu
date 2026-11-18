@@ -24,7 +24,7 @@ the machine reproduces the low W bits of the AArch64 result exactly, including N
 and control flow. The CPU reference reports any value that does not.
 """
 from dataclasses import dataclass, field
-from .a64 import CLASSES, ALL_CLASSES, LOADS, STORES, MEMOPS
+from .a64 import CLASSES, ALL_CLASSES, SINGLE, PAIRS, MEMOPS
 
 ADDSUB = ("addsub_imm", "addsub_reg", "addsub_ext")
 LOGIC = ("logic_reg", "logic_imm")
@@ -55,7 +55,9 @@ class Config:
 
 class QuantumARM:
     # ------------------------------------------------------------------ low level
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, defer=False):
+        """defer=True: allocate the machine state only; call build(sink) to generate the cycles.
+        With a sink, each cycle's gates are passed to sink(gates, n_qubits) and then dropped."""
         self.cfg = c = cfg
         self.g = []          # gate list: ('x',t) ('cx',c,t) ('ccx',a,b,t) ('cswap',c,a,b)
         self.n = 0
@@ -72,9 +74,61 @@ class QuantumARM:
         self.ram = [self.reg(f"ram{m}", W) for m in range(c.MEM)]
         self.run = [self.reg("run0", 1)[0]]
         self.trap = []
-        for s in range(c.STEPS):
+        self.total = {}
+        if not defer:
+            self.build()
+
+    def run_fast(self, ones):
+        """Exact basis-state simulation without materialising every cycle.
+
+        Every cycle is the same gate list; only its per-cycle registers (results, history, next PC)
+        are fresh qubits. So one cycle is generated once (the template) and replayed STEPS times:
+        before each replay the per-cycle qubits are reset to |0> and the PC / running inputs are
+        taken from the previous cycle's outputs -- exactly what the full circuit does with new
+        qubits. Returns the final state (machine-state qubits are valid) and the per-cycle
+        PC trace, trap and running bits. Qubit/gate totals are those of the full circuit."""
+        from .bitsim import Streamer
+        c = self.cfg
+        pc_in, run_in = self.pc, self.run[0]
+        n0 = self.n
+        self._step(0)
+        tmpl = self.g
+        self.g = []
+        step_ids = list(range(n0, self.n))                 # everything allocated by the cycle ...
+        pool = set(self.pool)
+        step_ids = [q for q in step_ids if q not in pool]  # ... except reused scratch (always back to 0)
+        npc, run_out, trap = self.pc, self.run[1], self.trap[0]
+        per_step = len(step_ids)
+        self.template_gates = len(tmpl)
+        sim = Streamer(ones)
+        sim.s.extend(bytes(max(0, self.n - len(sim.s))))
+        st = sim.s
+        trace = [sum(st[q] << i for i, q in enumerate(pc_in))]
+        runs, traps = [], []
+        for k in range(c.STEPS):
+            if k:
+                for q in step_ids: st[q] = 0
+            sim(tmpl, self.n)
+            trace.append(sum(st[q] << i for i, q in enumerate(npc)))
+            runs.append(st[run_out]); traps.append(st[trap])
+            for i, q in enumerate(pc_in): st[q] = st[npc[i]]
+            st[run_in] = st[run_out]
+        from collections import Counter
+        cnt = Counter(g[0] for g in tmpl)
+        self.total = {k: v * c.STEPS for k, v in cnt.items()}
+        self.n_total = self.n + per_step * (c.STEPS - 1)
+        return dict(state=st, trace=trace, run=runs[-1] if runs else st[run_in], trap=any(traps))
+
+    def build(self, sink=None):
+        for s in range(self.cfg.STEPS):
             self._step(s)
+            if sink is not None:
+                for g in self.g:
+                    self.total[g[0]] = self.total.get(g[0], 0) + 1
+                sink(self.g, self.n)
+                self.g = []
         self.final_pc = self.pc
+        return self
 
     def reg(self, name, size):
         q = list(range(self.n, self.n + size))
@@ -268,7 +322,12 @@ class QuantumARM:
         fcc = f.get("ccmp", Z)
         fas2 = self.fresh_xor(fadd, fcc) if has("ccmp") else fadd
         fmul = G("madd", "maddl")
-        fld, fst, fmem = G(*LOADS), G(*STORES), G(*MEMOPS)
+        fmem = G(*MEMOPS)
+        fsg = G(*SINGLE)
+        fld = self.fresh_xor(f.get("ld_pair", Z))       # loads: single with opc != 00, LDP
+        self.mcx([(fsg, 1), (ir[22], 1)], fld); self.mcx([(fsg, 1), (ir[22], 0), (ir[23], 1)], fld)
+        fst = self.fresh_xor(f.get("st_pair", Z))       # stores: single with opc == 00, STP
+        self.mcx([(fsg, 1), (ir[22], 0), (ir[23], 0)], fst)
 
         # OPERANDS
         rn_sp = G("addsub_imm", "addsub_ext", *MEMOPS) if c.sp else None
@@ -278,11 +337,11 @@ class QuantumARM:
         self.read_reg(ir, 0, G("movw", "cbz", "tbz"), None, A)            # A = Rt (MOVK, CBZ, TBZ)
         Bm = self.alloc(W)
         self.read_reg(ir, 16, G("addsub_reg", "addsub_ext", "logic_reg", "csel", "ccmp", "madd", "maddl", "shiftv",
-                                "div", "ld_reg", "ldsw_reg", "st_reg"), None, Bm)   # Bm = Rm
+                                "div", "ldst_reg"), None, Bm)   # Bm = Rm
         Ra = Dt = Dt2 = None
         if has("madd", "maddl"):
             Ra = self.alloc(W); self.read_reg(ir, 10, fmul, None, Ra)
-        if has(*STORES):
+        if has(*MEMOPS):
             Dt = self.alloc(W); self.read_reg(ir, 0, fst, None, Dt)
             if has("st_pair"):
                 Dt2 = self.alloc(W); self.read_reg(ir, 10, f["st_pair"], None, Dt2)
@@ -375,6 +434,12 @@ class QuantumARM:
             self.gated_copy(f["shiftv"], self.shifter(A, amt, right, ir[11], 6, lsr=ir[10], sf=sf), R)
         if has("div"):
             self.gated_copy(f["div"], self._div(A, Bm, ir[10]), R)
+        if has("adrp"):     # ((4*PC) & ~0xFFF) + (imm21 << 12): bits below 12 are zero
+            if W > 12:
+                imm = [ir[29], ir[30]] + list(ir[5:24])
+                pcp = [self.pc[10 + i] if 10 + i < p else Z for i in range(W - 12)]
+                pg, _ = self.add(pcp, imm[:W - 12], Z, W - 12)
+                for i in range(W - 12): self.ccx(f["adrp"], pg[i], R[12 + i])
 
         # DATA MEMORY: byte offset, effective address, writeback value
         R2 = WBv = None
@@ -387,7 +452,7 @@ class QuantumARM:
             sz = self.a1()
             self.ccx(fsingle, ir[30], sz); self.ccx(fpair, ir[31], sz)
             off = self.alloc(W)
-            fui, fi9, freg = G("ld_ui", "ldsw_ui", "st_ui"), G("ld_i9", "ldsw_i9", "st_i9"), G("ld_reg", "ldsw_reg", "st_reg")
+            fui, fi9, freg = G("ldst_ui"), G("ldst_i9"), G("ldst_reg")
             for i in range(W):      # unsigned offset: imm12 << (2 + sz)
                 if 0 <= i - 2 < 12: self.mcx([(fui, 1), (sz, 0), (ir[10 + i - 2], 1)], off[i])
                 if 0 <= i - 3 < 12: self.mcx([(fui, 1), (sz, 1), (ir[10 + i - 3], 1)], off[i])
@@ -410,7 +475,7 @@ class QuantumARM:
             idx = [E[2 + j] for j in range(m)]
             idxc = [idx] + [self.add(idx, [ONE if (k >> j) & 1 else Z for j in range(m)], Z, m)[0] for k in (1, 2, 3)]
             sel_eq = lambda ix, slot: [(ix[j], (slot >> j) & 1) for j in range(m)]
-            if has(*LOADS):
+            if has(*MEMOPS):
                 for slot in range(c.MEM):
                     self.local(lambda: self.fresh_match([(fld, 1)] + sel_eq(idx, slot)),
                                lambda sl: self.gated_copy(sl, self.ram[slot], R))
@@ -421,7 +486,7 @@ class QuantumARM:
                                lambda sl: self.gated_copy(sl, self.ram[slot], R2))
                     self.local(lambda: self.fresh_match([(f["ld_pair"], 1), (sz, 1)] + sel_eq(idxc[2], slot)),
                                lambda sl: self.gated_copy(sl, self.ram[slot], R2))
-            if has(*STORES):
+            if has(*MEMOPS):
                 stp = f.get("st_pair", Z)
                 xs = self.fresh_and(fst, sz)
                 e = [fst, self.fresh_xor(xs, self.fresh_match([(stp, 1), (sz, 0)])),
@@ -458,7 +523,9 @@ class QuantumARM:
 
         # WRITE PORTS: (value, field position, enable, sp_ctx, fixed register)
         rd_sp = self.fresh_match([(G("addsub_imm", "addsub_ext"), 1), (s29, 0)]) if c.sp else None
-        ports = [(R, 0, G(*ADDSUB, *LOGIC, "movw", "csel", "madd", "maddl", "bfm", "shiftv", "div", *LOADS), rd_sp, None)]
+        w0 = G(*ADDSUB, *LOGIC, "movw", "csel", "madd", "maddl", "bfm", "shiftv", "div", "adrp")
+        if has(*MEMOPS): self.cx(fld, w0)
+        ports = [(R, 0, w0, rd_sp, None)]
         if R2 is not None:
             ports.append((R2, 10, f["ld_pair"], None, None))
         if WBv is not None:
@@ -700,7 +767,9 @@ class QuantumARM:
 
     def counts(self):
         from collections import Counter
-        return dict(Counter(g[0] for g in self.g))
+        out = Counter(g[0] for g in self.g)
+        for k, v in self.total.items(): out[k] += v
+        return dict(out)
 
     def to_qiskit(self, init_ones=(), measure=None):
         """Build a qiskit QuantumCircuit: X on init qubits, the interpreter, measurements.

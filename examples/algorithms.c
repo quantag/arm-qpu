@@ -1,4 +1,9 @@
-/* Small classic algorithms, used as end-to-end tests: C -> clang -> AArch64 -> CPU and QPU. */
+/* Small classic algorithms: C -> clang or gcc -> AArch64 binary -> quantum machine.
+ *   clang --target=aarch64-linux-gnu -O1 -Iinclude -c examples/algorithms.c -o algorithms.o
+ *   python3 arm_qpu.py algorithms.o                            # runs main()
+ *   python3 arm_qpu.py algorithms.o --entry gcd --args 84 36   # one function
+ */
+#include <stdio.h>
 
 int gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } return a; }
 
@@ -45,3 +50,18 @@ int binary_search(const int *a, int n, int key) {
 }
 
 int digit_sum(int n) { int s = 0; while (n > 0) { s += n % 10; n /= 10; } return s; }
+
+/* volatile: the compiler cannot precompute the results, the QPU has to */
+static int input(int x) { volatile int v = x; return v; }
+
+int main(void) {
+    printf("Classic algorithms on a quantum von Neumann machine\n");
+    printf("  gcd(84, 36)      = %d\n", gcd(input(84), input(36)));
+    printf("  fib(10)          = %d\n", fib(input(10)));
+    printf("  is_prime(89)     = %s\n", is_prime(input(89)) ? "yes" : "no");
+    printf("  popcount(109)    = %d\n", popcount(input(109)));
+    printf("  isqrt(70)        = %d\n", isqrt(input(70)));
+    printf("  3^5 mod 13       = %d\n", power_mod(input(3), input(5), input(13)));
+    printf("  max3(-7, 12, 5)  = %d\n", max3(input(-7), input(12), input(5)));
+    return 0;
+}

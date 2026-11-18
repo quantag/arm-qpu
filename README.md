@@ -1,8 +1,14 @@
 # arm-qpu: run an ARM64 binary on a quantum computer
 
-`arm_qpu.py` takes an AArch64 binary compiled from C (or any language), runs it on a
-**quantum stored-program (von Neumann) processor** made entirely of quantum gates, runs the
-same bytes on an ARM CPU emulator, and writes a report comparing the two.
+Write an ordinary C program, compile it to an AArch64 binary with clang or gcc, and run that
+binary on a **quantum stored-program (von Neumann) processor** made entirely of quantum gates.
+The program's output appears as if you had run it locally:
+
+```
+$ python3 arm_qpu.py hello.o
+Hello from the QPU!
+84 = 2 2 3 7
+```
 
 The quantum processor is **one fixed reversible circuit** (X, CNOT, Toffoli, Fredkin gates).
 It has program memory, a program counter, fetch, a decoder for 32 A64 instruction classes,
@@ -10,13 +16,16 @@ It has program memory, a program counter, fetch, a decoder for 32 A64 instructio
 multiplier, divider, bitmask decoder), and a branch unit with calls and returns.
 The binary is **not compiled into the circuit**: its 32-bit instruction words are loaded as
 the initial state of the program-memory qubits. Nothing inside the circuit is measured or
-classically dispatched.
+classically dispatched. The same bytes also run on an ARM CPU emulator as a reference, so
+every run is checked.
 
-## Quick start: factorization in C
+## Quick start
 
-`examples/factor.c`:
+`examples/hello.c` is plain C:
 
 ```c
+#include <stdio.h>
+
 int smallest_factor(int n) {
     for (int d = 2; d * d <= n; d++)
         if (n % d == 0)
@@ -24,77 +33,146 @@ int smallest_factor(int n) {
     return n;
 }
 
-int factorize(int n, int *out) {          /* writes the prime factors to out[] */
-    int k = 0;
+int main(void) {
+    int n = 84;
+    printf("Hello from the QPU!\n");
+    printf("%d =", n);
     while (n > 1) {
         int p = smallest_factor(n);
-        out[k++] = p;
+        printf(" %d", p);
         n /= p;
     }
-    return k;
+    printf("\n");
+    return 0;
 }
 ```
 
-**Step 1: compile the C file to an ARM64 binary** (clang or gcc, your choice):
+**Step 1: compile it to an ARM64 binary** with clang or gcc:
 
 ```bash
-clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o factor.o
+clang --target=aarch64-linux-gnu -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 # or
-aarch64-linux-gnu-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
+aarch64-linux-gnu-gcc -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 ```
 
-`factor.o` is a normal AArch64 ELF object file. These are the bytes that run on the CPU and
-on the QPU. You can inspect them with `llvm-objdump -d factor.o` (or
-`aarch64-linux-gnu-objdump -d factor.o`).
+`hello.o` is a normal AArch64 ELF object file: these are the bytes that run. `-Iinclude`
+picks up the small `include/stdio.h` of this repository (no system headers or libc needed).
+Inspect the machine code with `llvm-objdump -d hello.o`.
 
-**Step 2: run the binary on the QPU and the CPU** (`&0` = pointer to data-memory cell 0,
-where the factors are written):
+**Step 2: run the binary on the QPU:**
+
+```bash
+python3 arm_qpu.py hello.o
+```
+
+```
+Hello from the QPU!
+84 = 2 2 3 7
+```
+
+Like a local run, the exit code is `main`'s return value.
+
+**Step 3 (optional): see what happened** with `-v`:
+
+```bash
+python3 arm_qpu.py hello.o -v
+```
+
+```
+Hello from the QPU!
+84 = 2 2 3 7
+------------------------------------------------------------
+MATCH: the QPU produced the same result as the CPU
+return value X0: CPU = 0, QPU = 0
+program output: CPU and QPU identical
+quantum machine: 504168 qubits, 88919129 gates (55966482 Toffoli), 221 steps, W = 12
+report: hello.main.report.md
+```
+
+The report (`.md` and `.json`) contains:
+- the program output from both machines;
+- registers, flags, data memory and the step-by-step PC trace compared between CPU and QPU;
+- the disassembly, with every instruction marked supported or not and how often it ran;
+- the circuit's resources and the model check.
+
+`--report PREFIX` writes the report without printing the analysis.
+
+**Run a single function** instead of `main`:
 
 ```bash
 python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+# factorize(84, &0) = 4          (&0 = pointer to user data cell 0; the factors are written there)
 ```
 
+Options: `--entry FUNC` (default `main`), `--args` for X0, X1, ... (`&k` = pointer to user data
+cell k), `--mem=1,2,3` to initialise user data cells (32-bit), `-v`, `--report PREFIX`,
+`--config config.json`.
+
+*Shortcut:* `arm_qpu.py` also accepts a `.c` file and runs step 1 itself (`--cc clang|gcc`,
+`-O 0|1|2|s`). The compile command it used is shown with `-v`. The binary is still what runs.
+
+## Examples
+
+| file | what it prints |
+|---|---|
+| `examples/hello.c` | a greeting and the factorization of 84 |
+| `examples/factor.c` | prime factorizations of 84, 91 and 97 |
+| `examples/algorithms.c` | gcd, Fibonacci, primality, popcount, integer square root, modular power, max |
+
 ```
-MATCH: the QPU produced the same result as the CPU
-return value X0: CPU = 4, QPU = 4
-quantum machine: 21201 qubits, 3491712 gates (1917792 Toffoli), 72 steps
-report: factor.factorize.report.md
+$ python3 arm_qpu.py algorithms.o
+Classic algorithms on a quantum von Neumann machine
+  gcd(84, 36)      = 12
+  fib(10)          = 55
+  is_prime(89)     = yes
+  popcount(109)    = 5
+  isqrt(70)        = 8
+  3^5 mod 13       = 9
+  max3(-7, 12, 5)  = 12
 ```
 
-The report shows data memory `[2, 2, 3, 7, ...]` on both machines, identical registers,
-flags and step-by-step PC trace, the disassembly with every instruction marked supported or
-not, and the circuit's resources.
+The inputs go through a `volatile` variable, so the compiler cannot compute the answers in
+advance: the QPU computes them. `factor.c` and `algorithms.c` each take about 20 seconds to
+simulate on a laptop; `hello.c` about 7 seconds.
 
-Options: `--entry FUNC` (default `main`, else the first function), `--args` for X0, X1, ...
-(`&k` = pointer to data cell k), `--mem=1,2,3` to initialise data memory (32-bit cells),
-`--config config.json`, `--report PREFIX`.
+## How printf works
 
-*Shortcut:* `arm_qpu.py` also accepts the `.c` file and runs step 1 itself
-(`python3 arm_qpu.py examples/factor.c --cc gcc -O 1 --entry factorize --args 84 '&0'`).
-It prints the exact compile command it used. The binary is still what gets executed.
+All computation, including every value that gets printed, happens on the QPU. Text formatting
+happens on the host:
+
+1. The linker step in `arm_qpu.py` binds `printf`, `puts` and `putchar` to a small output stub,
+   about 20 A64 instructions that run on the QPU like any other code.
+2. Each call appends a record to an **output log** in data memory: the kind of call, the format
+   string's address and the integer or pointer arguments.
+3. After the run, the log is read out of the measured data memory and formatted on the host
+   with C printf rules. The format strings come from the program's `.rodata`.
+4. The CPU reference runs the same stub, so the two outputs are compared; `-v` shows the result.
+
+This is how a real computer works too: the CPU writes to an output device, and the text is
+drawn elsewhere. On a quantum computer it also keeps the circuit coherent to the end, because
+everything is measured once, after the run.
+
+Limits: integers and pointers only (no `%f`); up to 6 arguments per call; `%s` works for
+string constants, not for text built in memory at run time; 32 output calls per run by
+default (`output_records`). `printf("text\n")` is often turned into `puts` by the compiler,
+which is supported.
 
 ## Compiling C to an ARM64 binary: clang or gcc
 
 Both compilers are supported and tested; they produce the same results. Compile with `-c` to
-an object file (`.o`) and pass that file to `arm_qpu.py`.
+an object file (`.o`) and pass that file to `arm_qpu.py`. Recommended flags:
+`-O1 -fno-stack-protector -Iinclude`. Ubuntu's gcc enables a stack protector by default, which
+needs a libc symbol.
 
 | compiler | command | output |
 |---|---|---|
-| clang, any OS (cross-compiles, no ARM machine needed) | `clang --target=aarch64-linux-gnu -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
-| clang on macOS, Apple Silicon | `clang -O1 -c prog.c -o prog.o` | Mach-O |
-| gcc, Linux cross toolchain | `aarch64-linux-gnu-gcc -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
-| gcc, Arm GNU Toolchain (Windows, macOS, Linux) | `aarch64-none-elf-gcc -O1 -ffreestanding -c prog.c -o prog.o` | ELF |
-| gcc on a native ARM64 Linux machine (Raspberry Pi, Graviton, ...) | `gcc -O1 -c prog.c -o prog.o` | ELF |
+| clang, any OS (cross-compiles, no ARM machine needed) | `clang --target=aarch64-linux-gnu -O1 -fno-stack-protector -Iinclude -c prog.c -o prog.o` | ELF |
+| clang on macOS, Apple Silicon | `clang -O1 -fno-stack-protector -Iinclude -c prog.c -o prog.o` | Mach-O |
+| gcc, Linux cross toolchain | `aarch64-linux-gnu-gcc -O1 -fno-stack-protector -Iinclude -c prog.c -o prog.o` | ELF |
+| gcc, Arm GNU Toolchain (Windows, macOS, Linux) | `aarch64-none-elf-gcc -O1 -fno-stack-protector -Iinclude -c prog.c -o prog.o` | ELF |
+| gcc on a native ARM64 Linux machine (Raspberry Pi, Graviton, ...) | `gcc -O1 -fno-stack-protector -Iinclude -c prog.c -o prog.o` | ELF |
 
-```bash
-python3 arm_qpu.py prog.o --entry my_function --args 5 7
-```
-
-For the `.c` shortcut, `compiler` in `config.json` (or `--cc`) chooses the compiler. `auto` tries
-`clang`, then `aarch64-linux-gnu-gcc`, `aarch64-none-linux-gnu-gcc`, `aarch64-none-elf-gcc`
-and `aarch64-elf-gcc`. Write plain functions with no libc calls: there is no `printf` or
-`malloc` on the quantum machine. Return results in the return value or through a pointer
-argument (`&k`).
+Programs use no libc beyond `printf`/`puts`/`putchar`; there is no `malloc` or file I/O.
 
 ## Step-by-step: Linux (Ubuntu / Debian)
 
@@ -111,18 +189,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. compile C to an ARM64 binary: with clang ...
-clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o factor.o
+clang --target=aarch64-linux-gnu -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 #    ... or with gcc
-aarch64-linux-gnu-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
+aarch64-linux-gnu-gcc -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 
 # 4. (optional) look at the ARM machine code you are about to run
-llvm-objdump -d factor.o
+llvm-objdump -d hello.o
 
-# 5. run the binary on the quantum machine (and on the CPU reference)
-python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+# 5. run the binary on the quantum machine
+python3 arm_qpu.py hello.o
 
-# 6. read the report
-less factor.factorize.report.md
+# 6. (optional) CPU/QPU comparison, resources, report
+python3 arm_qpu.py hello.o -v
 ```
 
 On Fedora: `sudo dnf install clang llvm gcc-aarch64-linux-gnu python3 git`. On Arch Linux:
@@ -150,16 +228,16 @@ py -m venv .venv
 pip install -r requirements.txt
 
 # 3. compile C to an ARM64 binary with clang
-clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples\factor.c -o factor.o
+clang --target=aarch64-linux-gnu -O1 -fno-stack-protector -Iinclude -c examples\hello.c -o hello.o
 
 # 4. (optional) look at the ARM machine code
-llvm-objdump -d factor.o
+llvm-objdump -d hello.o
 
-# 5. run the binary on the quantum machine (keep '&0' in single quotes in PowerShell)
-python arm_qpu.py factor.o --entry factorize --args 84 '&0'
+# 5. run the binary on the quantum machine
+python arm_qpu.py hello.o
 
-# 6. read the report
-notepad factor.factorize.report.md
+# 6. (optional) CPU/QPU comparison, resources, report
+python arm_qpu.py hello.o -v
 ```
 
 **gcc on Windows.** Use the Arm GNU Toolchain:
@@ -171,11 +249,12 @@ notepad factor.factorize.report.md
 4. Compile with gcc instead of clang (step 3 above), then run the binary as before:
 
 ```powershell
-aarch64-none-elf-gcc -O1 -ffreestanding -c examples\factor.c -o factor.o
-python arm_qpu.py factor.o --entry factorize --args 84 '&0'
+aarch64-none-elf-gcc -O1 -fno-stack-protector -Iinclude -c examples\hello.c -o hello.o
+python arm_qpu.py hello.o
 ```
 
-In `cmd.exe` write the pointer argument as `"&0"` (double quotes).
+To run a single function with a pointer argument, quote it: `'&0'` in PowerShell, `"&0"` in
+`cmd.exe`.
 
 ### Option B: WSL2 (Linux inside Windows)
 
@@ -196,12 +275,12 @@ git clone https://github.com/quantag/arm-qpu.git && cd arm-qpu
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
 # 3. compile C to an ARM64 binary (a native arm64 Mach-O object)
-clang -O1 -c examples/factor.c -o factor.o
+clang -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 #    or with gcc:  brew install aarch64-elf-gcc
-#                  aarch64-elf-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
+#                  aarch64-elf-gcc -O1 -fno-stack-protector -Iinclude -c examples/hello.c -o hello.o
 
 # 4. run the binary on the quantum machine
-python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+python3 arm_qpu.py hello.o
 ```
 
 ## config.json
@@ -215,7 +294,9 @@ python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
   "max_steps": "auto",
   "isa": "full",
   "compiler": "auto",
-  "cflags": ["-O1"],
+  "cflags": ["-O1", "-fno-stack-protector"],
+  "output_records": 32,
+  "stack_bytes": 256,
   "shots": 1024,
   "aer": {"method": "matrix_product_state"},
   "ibm": {"channel": "ibm_quantum_platform", "token": "env:IBM_QUANTUM_TOKEN",
@@ -226,13 +307,15 @@ python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
 | key | meaning |
 |---|---|
 | `backend` | `simulator`: exact simulation of the circuit on its basis-state input (fast, any size). `aer`: Qiskit Aer, sampled with `shots`. `ibm`: IBM Quantum hardware through Qiskit Runtime (`token` may be `env:VAR`). |
-| `register_width` | W, bits per register (8 to 16). `auto` = smallest W that holds the code addresses. |
+| `register_width` | W, bits per register (8 to 16). `auto` = smallest W that holds the code and data addresses. |
 | `registers` | `auto` = only registers the code uses; `all` = X0..X30; or a list. |
-| `memory_words` | data memory in 4-byte cells; `auto` = 2^(W-4) if the code touches memory. |
+| `memory_words` | data memory in 4-byte cells; `auto` = enough for the output log, data sections, user cells and stack. |
 | `max_steps` | machine cycles in the circuit; `auto` = what the CPU reference needed. |
 | `isa` | `full` = decoder implements every supported class; `auto` = only the classes the program uses (smaller circuit). |
 | `compiler` | for `.c` input: `auto`, `clang`, `gcc`, or a command name / path. |
-| `cflags` | compiler flags for `.c` input, default `["-O1"]`. |
+| `cflags` | compiler flags for `.c` input, default `["-O1", "-fno-stack-protector"]`. |
+| `output_records` | how many printf/puts/putchar calls the output log keeps (default 32). |
+| `stack_bytes` | stack reserved at the top of data memory (default 256). |
 
 Before submitting to hardware the runner checks the circuit's width against the device. A run
 that does not fit is reported as not submitted, with the reason.
@@ -249,10 +332,12 @@ that does not fit is reported as not submitted, with the reason.
 | conditional | CSEL, CSINC, CSINV, CSNEG, CSET, CSETM, CINC, CNEG, CCMP, CCMN |
 | branches | B, B.cond, CBZ, CBNZ, TBZ, TBNZ, BL, BLR, BR, RET |
 | memory | LDR, STR, LDRSW (unsigned offset, unscaled LDUR/STUR, pre-index, post-index, register offset with LSL/UXTW/SXTW), LDP, STP (offset, pre-, post-index) |
+| addresses | ADRP + ADD :lo12: (addresses of string literals and globals) |
+| output | `printf`, `puts`, `putchar` (see "How printf works") |
 | other | NOP and hints; HLT ends the run |
 
-Anything else (byte/halfword loads, ROR, BFI/BFXIL, CLZ/REV, ADR/ADRP, floating point, SIMD,
-system instructions) is listed in the report's "Unsupported instructions" table. A run that
+Anything else (byte/halfword loads and stores, ROR, BFI/BFXIL, CLZ/REV, ADR, floating point,
+SIMD, system instructions) is listed in the report's "Unsupported instructions" table. A run that
 reaches one stops with a trap; the CPU reference reports it first.
 
 ## The W-bit model, and when results are exact
@@ -273,14 +358,15 @@ non-negative W-bit values, which is why `register_width: auto` grows W with prog
 ## Tests
 
 ```bash
-python3 -m tests.test_c_programs clang   # 16 C cases x -O0/-O1/-O2 through arm_qpu.py (examples/*.c)
+python3 -m tests.test_c_programs clang   # C cases x -O0/-O1/-O2 + whole programs with printf
 python3 -m tests.test_c_programs gcc     # the same with aarch64-linux-gnu-gcc
 python3 -m tests.test_fuzz 500      # random A64 programs: one circuit, CPU vs QPU, regs/flags/memory/trace
 ```
 
 `test_c_programs` covers factorization, gcd, Fibonacci, primality, popcount, Collatz, integer
 square root, modular exponentiation, max3, function calls, bubble sort (in memory) and binary
-search. With both clang and gcc every case matches the CPU, except the flagged `digit_sum`
+search, plus the three example programs (`main` with printf), whose QPU output must equal
+the CPU output. With both clang and gcc every case matches the CPU, except the flagged `digit_sum`
 cases described above (gcc uses the multiply-by-constant trick even at `-O0`).
 The largest case (`bubble_sort` at `-O0`, about 800 000 qubits and 180 million gates) needs
 several GB of RAM. Run the two suites one after the other, not in parallel.
@@ -303,16 +389,23 @@ One machine cycle is a reversible block:
 After `HLT` (the return address the entry function starts with), the remaining cycles are
 no-ops. That is the synchronisation the Quantum Control Machine paper requires.
 
+Every cycle is the same gate list; only its per-cycle registers (results, history, next PC)
+are new qubits. The simulator therefore generates one cycle once and replays it, resetting
+the per-cycle qubits and feeding the previous cycle's PC in. That is the same computation as
+the full circuit, without holding hundreds of millions of gates in memory. The reported qubit
+and gate counts are those of the full circuit.
+
 Code: `qcpu/machine.py` (circuit), `qcpu/a64.py` (instruction classes and static check),
-`qcpu/reference.py` (CPU reference and model check), `qcpu/loader.py` (ELF/Mach-O with BL
-relocations), `qcpu/bitsim.py` (exact simulator), `arm_qpu.py` (CLI and reports).
+`qcpu/reference.py` (CPU reference and model check), `qcpu/loader.py` (ELF/Mach-O loader and
+linker, output stub), `qcpu/console.py` (output log to text), `qcpu/bitsim.py` (exact
+simulator), `arm_qpu.py` (CLI and reports), `include/stdio.h`.
 
 ## Honest status
 
 * Simulation: verified as above.
 * Hardware: the backend is implemented, but the circuits are far larger than today's devices.
   The smallest real program (`subs; cneg; ret`, `isa: auto`) needs 666 qubits and about 9 000
-  Toffoli gates; factorization needs about 27 000 qubits. Running on a QPU means a much smaller
+  Toffoli gates; `hello.c` needs about 500 000 qubits and 56 million Toffoli gates. Running on a QPU means a much smaller
   machine profile, or fault-tolerant hardware.
 * There is no speed-up: a classical program on a QPU is a very expensive reversible computer.
   The value is a verified bridge from ordinary binaries to quantum circuits: reversible oracles,

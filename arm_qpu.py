@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """Run an AArch64 binary on a quantum stored-program (von Neumann) processor.
 
-    python3 arm_qpu.py prog.c --entry factor --args 91            # compiles with clang or gcc first
-    python3 arm_qpu.py prog.o --entry factor --args 91 [--mem=1,2,3] [--config config.json]
+    python3 arm_qpu.py hello.o                          # runs main(); prints the program's output
+    python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+    python3 arm_qpu.py hello.o -v                       # + CPU/QPU comparison, resources, report
 
-The same machine code runs on a CPU (Unicorn AArch64 emulator, as reference) and on the
-quantum interpreter circuit (backend from config.json: simulator | aer | ibm). A report
-(Markdown + JSON) lists unsupported instructions, resources and the CPU/QPU comparison.
+The machine code runs on the quantum interpreter circuit (backend from config.json:
+simulator | aer | ibm) and, as a reference, on a CPU (Unicorn AArch64 emulator). printf,
+puts and putchar work: the program's output is printed as if it had run locally.
+With -v / --report: verdict, resources and a Markdown + JSON report.
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qcpu.a64 import check, disassemble, ALL_CLASSES, MEMOPS
-from qcpu.loader import load_program
+from qcpu.loader import ObjectImage, LinkError
 from qcpu.machine import Config, QuantumARM
-from qcpu.bitsim import simulate, value
+from qcpu.bitsim import value, Streamer
+from qcpu import console
 from qcpu.reference import run_reference, layout, DATA_BASE, CODE_BASE
 
 DEFAULTS = {
     "backend": "simulator",          # simulator | aer | ibm
     "register_width": "auto",        # W: bits per register; auto = smallest W >= 8 the code layout allows
     "registers": "auto",             # auto | all | [0, 1, 2, ...]
-    "memory_words": "auto",          # data memory cells (4 bytes each); auto = 2^(W-4) if the code uses memory
+    "memory_words": "auto",          # data memory cells (4 bytes each); auto = sized to log + data + stack
     "max_steps": "auto",             # auto = number of steps the CPU reference needs
     "isa": "full",                   # full = every implemented class in the decoder | auto = only classes used
     "compiler": "auto",              # for .c input: auto | clang | gcc | a command name / path
-    "cflags": ["-O1"],
+    "cflags": ["-O1", "-fno-stack-protector"],
+    "output_records": 32,            # printf/puts/putchar calls kept in the output log
+    "stack_bytes": 256,
     "shots": 1024,
     "aer": {"method": "matrix_product_state"},
     "ibm": {"channel": "ibm_quantum_platform", "token": "env:IBM_QUANTUM_TOKEN", "instance": None,
@@ -72,11 +77,11 @@ def find_compiler(choice):
 def compile_c(src, choice, cflags):
     cc = find_compiler(choice)
     out = os.path.join(tempfile.mkdtemp(prefix="arm_qpu_"), os.path.splitext(os.path.basename(src))[0] + ".o")
-    cmd = cc + list(cflags) + ["-ffreestanding", "-c", src, "-o", out]
+    inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "include")
+    cmd = cc + list(cflags) + ["-I" + inc, "-c", src, "-o", out]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode:
         sys.exit("compile failed: " + " ".join(cmd) + "\n" + p.stderr)
-    print("compiled: " + " ".join(cmd))
     return out, " ".join(cmd)
 
 
@@ -94,54 +99,82 @@ def parse_val(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("binary", help="C source (.c), AArch64 ELF/Mach-O object or executable, or raw .bin")
-    ap.add_argument("--cc", help="compiler for .c input: clang | gcc | command (overrides config)")
-    ap.add_argument("-O", dest="opt", help="optimization level for .c input, e.g. -O2 (overrides config cflags)")
+    ap.add_argument("binary", help="AArch64 ELF/Mach-O object or executable (or raw .bin); a .c file is compiled first")
     ap.add_argument("--entry", help="function to run (default: main, else the first function)")
-    ap.add_argument("--args", nargs="*", default=[], help="X0, X1, ... initial values; '&k' = pointer to data cell k")
-    ap.add_argument("--mem", default="", help="initial data memory cells (32-bit ints), comma separated")
+    ap.add_argument("--args", nargs="*", default=[], help="X0, X1, ... initial values; '&k' = pointer to user data cell k")
+    ap.add_argument("--mem", default="", help="user data cells (32-bit ints), comma separated: --mem=1,2,3")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
-    ap.add_argument("--report", help="report path prefix (default: <binary>.<entry>.report)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show the CPU/QPU comparison and resources; write a report")
+    ap.add_argument("--report", help="write the report to PREFIX.md / PREFIX.json")
+    ap.add_argument("--cc", help="compiler for .c input: clang | gcc | command (overrides config)")
+    ap.add_argument("-O", dest="opt", help="optimization level for .c input: 0, 1, 2, s (overrides config cflags)")
     a = ap.parse_args()
     cfg = load_config(a.config)
+    say = (lambda *x: print(*x)) if a.verbose else (lambda *x: None)
     compiled_with = None
     source = a.binary
     if a.binary.endswith(".c"):
         cflags = [f for f in cfg["cflags"] if not f.startswith("-O")] + [f"-O{a.opt}"] if a.opt else cfg["cflags"]
-        obj, compiled_with = compile_c(a.binary, a.cc or cfg["compiler"], cflags)
-        a.report = a.report or f"{os.path.splitext(a.binary)[0]}.{a.entry or 'main'}.report"
-        a.binary = obj
+        obj_path, compiled_with = compile_c(a.binary, a.cc or cfg["compiler"], cflags)
+        say("compiled: " + compiled_with)
+        default_prefix = os.path.splitext(a.binary)[0]
+        a.binary = obj_path
+    else:
+        default_prefix = os.path.splitext(a.binary)[0]
 
-    prog = load_program(a.binary, a.entry)
+    # ---- link: output log at data offset 0, then the program's data sections
+    try:
+        obj = ObjectImage(a.binary)
+        probe = obj.link(a.entry)
+        records = int(cfg["output_records"]) if probe["uses_output"] else 0
+        log_bytes = console.RECORD * (records + 1) if probe["uses_output"] else 0
+        prog = obj.link(a.entry, data_offset=log_bytes, log_capacity=records)
+    except LinkError as e:
+        sys.exit(f"error: {e}")
     code = prog["words"]
     n = len(code)
     slots = 2
     while slots < n + 1:
         slots *= 2
-    # code addresses (4 * slot) and stack/data pointers must be non-negative W-bit values
-    need = (4 * slots - 1).bit_length() + 1
-    W = max(8, need) if cfg["register_width"] == "auto" else int(cfg["register_width"])
-    if W < need:
-        sys.exit(f"error: {n} instructions need {slots} program slots; code addresses need W >= {need} "
-                 f"(register_width is {W})")
-    if W > 16:
-        sys.exit(f"error: program too large ({n} instructions) for the W <= 16 machine")
     words = layout(code, slots)
     asm = disassemble(b"".join(w.to_bytes(4, "little") for w in code), CODE_BASE)
     checks = [check(w, i, slots) for i, w in enumerate(code)]
     names_at = {v: k for k, v in prog["functions"].items()}
 
-    # inputs
+    # ---- data memory: [output log][data sections][user cells][stack]
     raw_args = [parse_val(x) for x in a.args]
     mem_init = [int(x, 0) for x in a.mem.split(",") if x.strip()] if a.mem else []
-    uses_mem = any(c.ok and c.cls in MEMOPS for c in checks) or any(t == "ptr" for t, _ in raw_args) or mem_init
-    MEM = cfg["memory_words"]
-    if MEM == "auto":
-        MEM = (1 << (W - 4)) if uses_mem else 0
-        while MEM and MEM < len(mem_init): MEM *= 2
-    MEM = int(MEM)
-    cpu_args = [DATA_BASE + 4 * v if t == "ptr" else v for t, v in raw_args]
-    qpu_args = [4 * v if t == "ptr" else v for t, v in raw_args]
+    user_off = (prog["data_end"] + 15) // 16 * 16
+    user_cells = max(len(mem_init), 16 if any(t == "ptr" for t, _ in raw_args) else 0)
+    uses_mem = (any(c.ok and c.cls in MEMOPS for c in checks) or user_cells or prog["uses_output"]
+                or prog["data_end"] > prog["data_offset"])
+    stack = int(cfg["stack_bytes"]) if uses_mem else 0
+    need = user_off + 4 * user_cells + stack + (64 if uses_mem else 0)
+    if cfg["memory_words"] == "auto":
+        MEM = 0
+        if uses_mem:
+            MEM = 16
+            while 4 * MEM < need: MEM *= 2
+    else:
+        MEM = int(cfg["memory_words"])
+        if 4 * MEM < need:
+            sys.exit(f"error: memory_words = {MEM} is too small; the layout needs {need} bytes")
+    need_w = max((4 * slots - 1).bit_length() + 1, (4 * MEM).bit_length() if MEM else 0)
+    W = max(8, need_w) if cfg["register_width"] == "auto" else int(cfg["register_width"])
+    if W < need_w:
+        sys.exit(f"error: code/data addresses need register_width >= {need_w} (it is {W})")
+    if W > 16:
+        sys.exit(f"error: program too large ({n} instructions, {4 * MEM} bytes of data) for the W <= 16 machine")
+    cells = [0] * MEM
+    img = prog["data_image"]
+    for i in range(0, len(img), 4):
+        cells[(prog["data_offset"] + i) // 4] = int.from_bytes(img[i:i + 4], "little")
+    for i, v in enumerate(mem_init):
+        cells[user_off // 4 + i] = v & 0xFFFFFFFF
+    image = bytes(b"".join((c & 0xFFFFFFFF).to_bytes(4, "little") for c in cells))
+    sp_off = 4 * MEM - 64 if MEM else 0
+    cpu_args = [DATA_BASE + user_off + 4 * v if t == "ptr" else v for t, v in raw_args]
+    qpu_args = [user_off + 4 * v if t == "ptr" else v for t, v in raw_args]
 
     # registers to instantiate
     used = set(range(len(raw_args))) | {0, 30}
@@ -152,60 +185,65 @@ def main():
             uses_sp |= c.uses_sp
     uses_sp |= 31 in used
     used.discard(31)
-    if cfg["registers"] == "all":
-        regs = tuple(range(31))
-    elif cfg["registers"] == "auto":
-        regs = tuple(sorted(used))
-    else:
-        regs = tuple(sorted(set(cfg["registers"]) | {30}))
+    regs = tuple(range(31)) if cfg["registers"] == "all" else tuple(sorted(used)) if cfg["registers"] == "auto" \
+        else tuple(sorted(set(cfg["registers"]) | {30}))
     classes = ALL_CLASSES if cfg["isa"] == "full" else tuple(sorted({c.cls for c in checks if c.ok} | {"hlt"}))
 
-    # CPU reference
-    ref = run_reference(words, W, prog["entry_index"], cpu_args, MEM, mem_init)
+    # ---- CPU reference
+    ref = run_reference(words, W, prog["entry_index"], cpu_args, MEM, cells, sp_off=sp_off)
     executed = {}
     for i in ref["trace"]:
         executed[i] = executed.get(i, 0) + 1
     steps = ref["steps"] if cfg["max_steps"] == "auto" else int(cfg["max_steps"])
-
-    report = dict(binary=a.binary, source=source, compiled_with=compiled_with, entry=prog["entry"], entry_index=prog["entry_index"], args=a.args,
-                  memory_init=mem_init, config=cfg, unresolved_relocations=prog["unresolved"])
+    report = dict(binary=a.binary, source=source, compiled_with=compiled_with, entry=prog["entry"],
+                  entry_index=prog["entry_index"], args=a.args, memory_init=mem_init, config=cfg,
+                  unresolved_relocations=prog["unresolved"], externs=prog["externs"],
+                  layout=dict(output_log=[0, log_bytes], data=[prog["data_offset"], prog["data_end"]],
+                              user=[user_off, user_off + 4 * user_cells], stack_top=sp_off, memory_bytes=4 * MEM))
     report["code"] = [dict(index=i, address=f"0x{CODE_BASE + 4 * i:x}", word=f"{w:08x}", asm=asm[i],
                            function=names_at.get(i), cls=checks[i].cls, supported=checks[i].ok,
                            reason=checks[i].reason, executed=executed.get(i, 0)) for i, w in enumerate(code)]
     report["unsupported"] = [x for x in report["code"] if not x["supported"]]
     report["cpu"] = dict(steps=ref["steps"], halted=ref["halted"], error=ref["error"], issues=ref["issues"],
                          x0=ref["regs"][0])
-    t0 = time.time()
+    ptr_off = lambda v: v - 0x10000000 if v >= 0x10000000 else v
+    if prog["uses_output"]:
+        report["cpu"]["output"], _ = console.render(lambda i: ref["mem"][i], image, ptr_off, records)
+    if prog["unresolved"]:
+        print("warning: unresolved symbols/relocations: " + "; ".join(prog["unresolved"]), file=sys.stderr)
     if ref["error"]:
-        report["verdict"] = f"NOT RUN on QPU: the CPU run failed or reached an unsupported instruction ({ref['error']})"
-        finish(report, a, prog, W)
-        return
+        report["verdict"] = f"NOT RUN on QPU: {ref['error']}"
+        print(f"error: {ref['error']}", file=sys.stderr)
+        finish(report, a, W, default_prefix, records)
+        sys.exit(1)
 
-    m = QuantumARM(Config(W=W, regs=regs, sp=uses_sp, SLOTS=slots, STEPS=steps, MEM=MEM, classes=classes))
-    gc = m.counts()
-    report["machine"] = dict(W=W, registers=[f"x{k}" for k in regs] + (["sp"] if uses_sp else []), program_slots=slots,
-                             steps=steps, data_memory_cells=MEM, decoder_classes=list(m.cfg.classes),
-                             qubits=m.n, gates=gc, toffoli=gc.get("ccx", 0), build_seconds=round(time.time() - t0, 2))
+    # ---- quantum machine
+    t0 = time.time()
+    m = QuantumARM(Config(W=W, regs=regs, sp=uses_sp, SLOTS=slots, STEPS=steps, MEM=MEM, classes=classes), defer=True)
     init = {i: v for i, v in enumerate(qpu_args)}
     init[30] = 4 * (slots - 1)
     if uses_sp:
-        init[31] = 4 * MEM
-    ones = m.load_bits(words, init, mem_init, pc=prog["entry_index"])
-
+        init[31] = sp_off
+    ones = m.load_bits(words, init, cells, pc=prog["entry_index"])
     backend = cfg["backend"]
-    t1 = time.time()
     if backend == "simulator":
-        st = simulate(m.g, m.n, ones)
+        out = m.run_fast(ones)
+        st = out["state"]
         q = dict(regs={k: value(st, m.X[k]) for k in m.X}, flags=[st[x] for x in m.nzcv],
-                 mem=[value(st, x) for x in m.ram], run=st[m.run[-1]], trap=any(st[x] for x in m.trap),
-                 trace=[value(st, pcr) for pcr in m.pc_hist[:ref["steps"]]], probability=1.0)
+                 mem=[value(st, x) for x in m.ram], run=out["run"], trap=out["trap"],
+                 trace=out["trace"][:ref["steps"]], probability=1.0)
         report["backend"] = dict(name="simulator", note="exact simulation of the reversible circuit on its basis-state input")
     else:
+        m.build()
         q = run_sampled(m, ones, cfg, backend, report)
-    report["backend"]["seconds"] = round(time.time() - t1, 2)
+    gc = m.counts()
+    report["machine"] = dict(W=W, registers=[f"x{k}" for k in regs] + (["sp"] if uses_sp else []), program_slots=slots,
+                             steps=steps, data_memory_cells=MEM, decoder_classes=list(m.cfg.classes),
+                             qubits=getattr(m, "n_total", m.n), gates=gc, toffoli=gc.get("ccx", 0))
+    report["backend"]["seconds"] = round(time.time() - t0, 2)
     if q is None:
-        finish(report, a, prog, W)
-        return
+        finish(report, a, W, default_prefix, records)
+        sys.exit(1)
 
     mk = (1 << W) - 1
     rows = []
@@ -216,16 +254,35 @@ def main():
     mem_ok = [v & mk for v in ref["mem"]] == q["mem"]
     flags_ok = ref["flags"] == q["flags"]
     trace_ok = q.get("trace") is None or q["trace"] == ref["trace"]
+    qtext = None
+    if prog["uses_output"]:
+        qtext, trunc = console.render(lambda i: sx(q["mem"][i], W) & 0xFFFFFFFF, image, ptr_off, records)
+        report["output_truncated"] = trunc
     ok = all(r["match"] for r in rows) and mem_ok and flags_ok and trace_ok and q["run"] == 0 and not q["trap"]
     report["result"] = dict(registers=rows, flags=dict(cpu=ref["flags"], qpu=q["flags"]), memory_match=mem_ok,
-                            memory=dict(cpu=[sx(v, W) for v in ref["mem"]], qpu=[sx(v, W) for v in q["mem"]]),
                             trace_match=trace_ok, halted=q["run"] == 0, trap=q["trap"], probability=q["probability"],
-                            return_value=dict(cpu=sx(ref["regs"][0], W), qpu=sx(q["regs"][0], W)))
+                            return_value=dict(cpu=sx(ref["regs"][0], W), qpu=sx(q["regs"][0], W)),
+                            output=dict(qpu=qtext, cpu=report["cpu"].get("output"),
+                                        match=qtext == report["cpu"].get("output")))
     exact = not ref["issues"]
     report["verdict"] = ("MATCH: the QPU produced the same result as the CPU" if ok else
                          "MISMATCH between QPU and CPU") + ("" if exact else
                          f" (warning: {len(ref['issues'])} value(s) did not fit the {W}-bit model, see model check)")
-    finish(report, a, prog, W)
+
+    # ---- what the user sees: the program's own output, as if it ran locally
+    ret = sx(q["regs"][0], W)
+    if prog["uses_output"]:
+        sys.stdout.write(qtext)
+        if qtext and not qtext.endswith("\n") and a.verbose:
+            print()
+        if report.get("output_truncated"):
+            print(f"warning: output truncated after {records} printf/puts/putchar calls (config output_records)", file=sys.stderr)
+    if prog["entry"] != "main" or not prog["uses_output"]:
+        print(f"{prog['entry']}({', '.join(a.args)}) = {ret}")
+    if not ok or not exact:
+        print(f"warning: {report['verdict']} -- run with -v for details", file=sys.stderr)
+    finish(report, a, W, default_prefix, records)
+    sys.exit(ret & 0xFF if prog["entry"] == "main" else 0)
 
 
 def run_sampled(m, ones, cfg, backend, report):
@@ -294,21 +351,27 @@ def run_sampled(m, ones, cfg, backend, report):
                 trace=None, probability=top[0][1] / total)
 
 
-def finish(report, a, prog, W):
-    prefix = a.report or f"{os.path.splitext(a.binary)[0]}.{prog['entry']}.report"
+def finish(report, a, W, default_prefix, records):
+    if not (a.verbose or a.report):
+        return
+    prefix = a.report or f"{default_prefix}.{report['entry']}.report"
     json.dump(report, open(prefix + ".json", "w"), indent=2, default=str)
     open(prefix + ".md", "w").write(markdown(report, W))
-    print(report["verdict"])
-    r = report.get("result")
-    if r:
-        print(f"return value X0: CPU = {r['return_value']['cpu']}, QPU = {r['return_value']['qpu']}")
-    mc = report.get("machine")
-    if mc:
-        print(f"quantum machine: {mc['qubits']} qubits, {sum(mc['gates'].values())} gates ({mc['toffoli']} Toffoli), "
-              f"{mc['steps']} steps")
-    if report["unsupported"]:
-        print(f"{len(report['unsupported'])} unsupported instruction(s) in the loaded code (see report)")
-    print(f"report: {prefix}.md")
+    if a.verbose:
+        print("-" * 60)
+        print(report["verdict"])
+        r = report.get("result")
+        if r:
+            print(f"return value X0: CPU = {r['return_value']['cpu']}, QPU = {r['return_value']['qpu']}")
+            if r["output"]["cpu"] is not None:
+                print(f"program output: CPU and QPU {'identical' if r['output']['match'] else 'DIFFER'}")
+        mc = report.get("machine")
+        if mc:
+            print(f"quantum machine: {mc['qubits']} qubits, {sum(mc['gates'].values())} gates ({mc['toffoli']} Toffoli), "
+                  f"{mc['steps']} steps, W = {mc['W']}")
+        if report["unsupported"]:
+            print(f"{len(report['unsupported'])} unsupported instruction(s) in the loaded code (see report)")
+        print(f"report: {prefix}.md")
 
 
 def markdown(r, W):
@@ -320,6 +383,12 @@ def markdown(r, W):
           f"- binary: `{r['binary']}`, function `{r['entry']}` (instruction {r['entry_index']})",
           f"- arguments: {' '.join(r['args']) or '(none)'}; data memory init: {r['memory_init'] or '(none)'}",
           f"- backend: `{r['config']['backend']}`, register width W = {W}", ""]
+    out = (res or {}).get("output") or {}
+    if out.get("qpu") is not None or r["cpu"].get("output") is not None:
+        L += ["## Program output", "", f"QPU and CPU output {'identical' if out.get('match') else 'DIFFER'}.", "",
+              "QPU:", "", "```", (out.get("qpu") or "").rstrip("\n"), "```", ""]
+        if not out.get("match"):
+            L += ["CPU:", "", "```", (r["cpu"].get("output") or "").rstrip("\n"), "```", ""]
     if r["unsupported"]:
         L += ["## Unsupported instructions", "",
               "These instructions are in the loaded code but not implemented by the quantum machine. "
@@ -335,7 +404,7 @@ def markdown(r, W):
         for x in res["registers"]:
             L.append(f"| {x['reg']} | {x['cpu_signed']} | {x['qpu_signed']} | {'yes' if x['match'] else '**NO**'} |")
         L += ["", f"- NZCV flags: CPU {res['flags']['cpu']}, QPU {res['flags']['qpu']}",
-              f"- data memory equal: {res['memory_match']}" + (f" (QPU: {res['memory']['qpu']})" if res['memory']['qpu'] else ""),
+              f"- data memory equal: {res['memory_match']}",
               f"- control-flow trace (PC per step) equal: {res['trace_match']}",
               f"- halted: {res['halted']}, trap: {res['trap']}, probability of this outcome: {res['probability']:.3f}", ""]
     mc = r.get("machine")
@@ -344,6 +413,7 @@ def markdown(r, W):
               f"- one fixed interpreter circuit: {mc['qubits']} qubits, gates {mc['gates']} ({mc['toffoli']} Toffoli)",
               f"- {mc['steps']} machine steps, {mc['program_slots']} program-memory slots x 32 qubits, "
               f"{mc['data_memory_cells']} data cells, registers {', '.join(mc['registers'])}",
+              f"- data memory layout (byte offsets): {r.get('layout')}",
               f"- decoder implements {len(mc['decoder_classes'])} instruction classes: {', '.join(mc['decoder_classes'])}", ""]
     bk = r.get("backend")
     if bk:

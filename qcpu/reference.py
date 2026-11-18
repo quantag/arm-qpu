@@ -9,7 +9,7 @@ Memory layout shared by both machines (addresses whose low W bits agree):
 """
 from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UcError, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
 from unicorn import arm64_const as A
-from .a64 import check, bits, datasize
+from .a64 import check, bits, datasize, MEMOPS, is_load
 
 CODE_BASE = 0x400000            # low 22 bits zero
 DATA_BASE = 0x10000000          # low 28 bits zero: a pointer's low W bits = offset into data memory
@@ -76,7 +76,7 @@ def layout(code_words, slots):
     return list(code_words) + [0] * (slots - 1 - len(code_words)) + [HLT_WORD]
 
 
-def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_steps=100000):
+def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_steps=100000, sp_off=None):
     """words: full program-memory image from layout()."""
     slots = len(words)
     halt_idx = slots - 1
@@ -92,7 +92,7 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
     for i, v in enumerate(args):
         mu.reg_write(XREG[i], v & 0xFFFFFFFFFFFFFFFF)
     mu.reg_write(A.UC_ARM64_REG_X30, CODE_BASE + 4 * halt_idx)
-    sp0 = DATA_BASE + 4 * mem_words
+    sp0 = DATA_BASE + (4 * mem_words if sp_off is None else sp_off)
     mu.reg_write(A.UC_ARM64_REG_SP, sp0)
     mu.reg_write(A.UC_ARM64_REG_NZCV, 0)
     issues = []
@@ -109,8 +109,8 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
         view = v & ((1 << ds) - 1)
         if _sext(view & mask, W) % (1 << ds) == view:
             return True
-        if ds == 64 and (-(1 << (W - 1)) <= v - DATA_BASE < (1 << (W - 1)) or 0 <= v - CODE_BASE < (1 << (W - 1))):
-            return True                                    # pointer into data memory / code
+        if -(1 << (W - 1)) <= view - DATA_BASE < (1 << (W - 1)) or 0 <= view - CODE_BASE < (1 << (W - 1)):
+            return True                                    # pointer into data memory / code (also its 32-bit view)
         return False
 
     def reg(r, sp_ctx):
@@ -155,7 +155,8 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
         pc = mu.reg_read(A.UC_ARM64_REG_PC)
         for r in chk.writes:
             v = reg(r, True)
-            wds = 64 if r == 31 or (r == 30 and chk.cls in ("bl", "bra")) else ds
+            base_wb = chk.cls in MEMOPS and r == bits(w, 5, 5) and not (is_load(w, chk.cls) and r == bits(w, 0, 5))
+            wds = 64 if r == 31 or base_wb or (r == 30 and chk.cls in ("bl", "bra")) else ds
             if not fits(v, wds):
                 issues.append(f"step {step} (instr {idx}): {'SP' if r == 31 else 'X%d' % r} = 0x{v:x} "
                               f"does not fit the {W}-bit model")

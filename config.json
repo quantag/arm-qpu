@@ -6,7 +6,7 @@
   "max_steps": "auto",
   "isa": "full",
   "compiler": "auto",
-  "cflags": ["-O1"],
+  "cflags": ["-O1", "-fno-stack-protector"],
   "shots": 1024,
   "aer": {"method": "matrix_product_state"},
   "ibm": {

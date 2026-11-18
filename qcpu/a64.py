@@ -31,23 +31,22 @@ CLASSES = {
     "bra":         (0xFF9FFC1F, 0xD61F0000),  # BR / BLR / RET
     "hlt":         (0xFFE0001F, 0xD4400000),  # HLT (end of run)
     "nop":         (0xFFFFF01F, 0xD503201F),  # NOP and other hints
-    # loads / stores of 32/64-bit registers
-    "ld_ui":       (0xBFC00000, 0xB9400000),  # LDR  Wt/Xt, [Xn|SP, #imm]
-    "ldsw_ui":     (0xFFC00000, 0xB9800000),  # LDRSW Xt, [Xn|SP, #imm]
-    "st_ui":       (0xBFC00000, 0xB9000000),  # STR  Wt/Xt, [Xn|SP, #imm]
-    "ld_i9":       (0xBFE00000, 0xB8400000),  # LDUR / LDR pre-, post-index
-    "ldsw_i9":     (0xFFE00000, 0xB8800000),  # LDURSW / LDRSW pre-, post-index
-    "st_i9":       (0xBFE00000, 0xB8000000),  # STUR / STR pre-, post-index
-    "ld_reg":      (0xBFE00C00, 0xB8600800),  # LDR  Wt/Xt, [Xn, Xm{, lsl #s}]
-    "ldsw_reg":    (0xFFE00C00, 0xB8A00800),  # LDRSW Xt, [Xn, Xm{, lsl #2}]
-    "st_reg":      (0xBFE00C00, 0xB8200800),  # STR  Wt/Xt, [Xn, Xm{, lsl #s}]
+    "adrp":        (0x9F000000, 0x90000000),  # ADRP (page address of a global / string literal)
+    # loads / stores of 32/64-bit values: LDR/STR Wt|Xt, LDRSW (byte/halfword forms: not implemented)
+    "ldst_ui":     (0xBB000000, 0xB9000000),  # [Xn|SP, #imm]  (unsigned, scaled offset)
+    "ldst_i9":     (0xBB200000, 0xB8000000),  # LDUR/STUR, pre-index [Xn, #imm]!, post-index [Xn], #imm
+    "ldst_reg":    (0xBB200C00, 0xB8200800),  # [Xn, Xm{, lsl #s}] / [Xn, Wm, sxtw|uxtw {#s}]
     "ld_pair":     (0x7E400000, 0x28400000),  # LDP  Wt/Xt (offset, pre-, post-index)
     "st_pair":     (0x7E400000, 0x28000000),  # STP  Wt/Xt (offset, pre-, post-index)
 }
 ALL_CLASSES = tuple(CLASSES)
-LOADS = ("ld_ui", "ldsw_ui", "ld_i9", "ldsw_i9", "ld_reg", "ldsw_reg", "ld_pair")
-STORES = ("st_ui", "st_i9", "st_reg", "st_pair")
-MEMOPS = LOADS + STORES
+SINGLE = ("ldst_ui", "ldst_i9", "ldst_reg")
+PAIRS = ("ld_pair", "st_pair")
+MEMOPS = SINGLE + PAIRS
+
+
+def is_load(w, cls):
+    return bits(w, 22, 1) == 1 if cls in PAIRS else bits(w, 22, 2) != 0
 
 
 def bits(w, lo, n):
@@ -86,12 +85,15 @@ def _decode_bitmask_valid(n, imms, sf):
 
 def datasize(w, cls):
     """Width (32/64) of the value an instruction produces/consumes in its registers."""
-    if cls in ("ldsw_ui", "ldsw_i9", "ldsw_reg", "maddl"):
+    if cls == "maddl":
         return 64
-    if cls in ("ld_pair", "st_pair"):
+    if cls in PAIRS:
         return 64 if bits(w, 31, 1) else 32
-    if cls in MEMOPS:
-        return 64 if bits(w, 30, 1) else 32
+    if cls in SINGLE:
+        size, opc = bits(w, 30, 2), bits(w, 22, 2)
+        return 64 if size == 3 or opc == 2 else 32
+    if cls == "adrp":
+        return 64
     return 64 if bits(w, 31, 1) else 32
 
 
@@ -102,6 +104,8 @@ def check(w, pc_index, n_instr, enabled=ALL_CLASSES):
     sf = bits(w, 31, 1)
     zr = lambda *rs: tuple(r for r in rs if r != 31)
     if c is None:
+        if w & 0xBB000000 in (0x39000000, 0x38000000, 0x19000000, 0x18000000) and not bits(w, 26, 1):
+            return Check(None, False, "byte/halfword load/store not implemented (32/64-bit only)")
         return Check(None, False, "instruction not implemented")
     if c not in enabled:
         return Check(c, False, f"class '{c}' disabled in config")
@@ -167,21 +171,28 @@ def check(w, pc_index, n_instr, enabled=ALL_CLASSES):
         return Check(c, True, reads=zr(rn), writes=(30,) if k == 1 else ())
     if c in ("hlt", "nop"):
         return Check(c, True)
+    if c == "adrp":
+        return Check(c, True, writes=zr(rd))
     if c in MEMOPS:
-        if c in ("ld_i9", "ldsw_i9", "st_i9") and bits(w, 10, 2) == 2:
+        if c in SINGLE:
+            size, opc = bits(w, 30, 2), bits(w, 22, 2)
+            if size == 3 and opc >= 2:
+                return Check(c, False, "prefetch (PRFM) not implemented" if opc == 2 else "unallocated")
+            if size == 2 and opc == 3:
+                return Check(c, False, "unallocated")
+        if c == "ldst_i9" and bits(w, 10, 2) == 2:
             return Check(c, False, "unprivileged load/store not implemented")
-        if c in ("ld_reg", "ldsw_reg", "st_reg") and bits(w, 13, 3) not in (2, 3, 6, 7):
+        if c == "ldst_reg" and bits(w, 13, 3) not in (2, 3, 6, 7):
             return Check(c, False, "register offset extend must be UXTW/LSL/SXTW/SXTX")
-        wb = (c in ("ld_i9", "ldsw_i9", "st_i9") and bits(w, 10, 2) in (1, 3)) or \
-             (c in ("ld_pair", "st_pair") and bits(w, 23, 2) in (1, 3))
+        wb = (c == "ldst_i9" and bits(w, 10, 2) in (1, 3)) or (c in PAIRS and bits(w, 23, 2) in (1, 3))
         base = (31,) if rn == 31 else (rn,)
-        rt2 = bits(w, 10, 5) if c in ("ld_pair", "st_pair") else None
-        reads = base + (zr(rm) if c in ("ld_reg", "ldsw_reg", "st_reg") else ())
+        rt2 = bits(w, 10, 5) if c in PAIRS else None
+        reads = base + (zr(rm) if c == "ldst_reg" else ())
         writes = base if wb else ()
-        if c in STORES:
-            reads += zr(rd) + (zr(rt2) if rt2 is not None else ())
-        else:
+        if is_load(w, c):
             writes += zr(rd) + (zr(rt2) if rt2 is not None else ())
+        else:
+            reads += zr(rd) + (zr(rt2) if rt2 is not None else ())
         return Check(c, True, reads=reads, writes=writes, uses_sp=rn == 31)
     return Check(c, False, "?")
 
