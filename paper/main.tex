@@ -303,6 +303,110 @@ covers the instructions that clang and gcc emit for typical integer C code at op
 levels \texttt{-O0} to \texttt{-O2}: loops, arithmetic, comparisons, function calls with stack
 frames, local arrays, and string literals passed to \texttt{printf}.
 
+\subsection{Worked example: from a C expression to gates}
+\label{sec:example}
+
+We follow one line of C through the machine. Compiled with \texttt{clang -O1},
+\begin{lstlisting}[language=C]
+int add3(int a) { return a + 3; }
+\end{lstlisting}
+becomes two instructions:
+\begin{lstlisting}[language={}]
+0:  11000c00   add  w0, w0, #3
+4:  d65f03c0   ret
+\end{lstlisting}
+
+\paragraph{The instruction word.} Table~\ref{tab:enc} shows how \texttt{0x11000c00} encodes
+``add immediate'': bits 28--23 select the class, \texttt{imm12} holds the constant 3, and
+\texttt{Rn} and \texttt{Rd} name register 0. In the machine these 32 bits are the basis state
+of the 32 qubits of program-memory slot 0.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+bits & 31 & 30 & 29 & 28--23 & 22 & 21--10 & 9--5 \,/\, 4--0 \\
+field & sf & op & S & class & sh & imm12 & Rn \,/\, Rd \\
+value & 0 (32-bit) & 0 (add) & 0 (no flags) & \texttt{100010} & 0 & \texttt{000000000011} = 3 & 0 \,/\, 0 \\
+\bottomrule
+\end{tabular}
+\caption{Fields of \texttt{add w0, w0, \#3} (\texttt{0x11000c00}).}
+\label{tab:enc}
+\end{table}
+
+\paragraph{Fetch.} With PC $=0$, the comparator for slot 0 sets a select qubit, and 32 Toffoli
+gates controlled by it and by the slot's qubits copy the word into the instruction register
+IR.
+
+\paragraph{Decode.} The class ``add/sub immediate'' is the pattern \texttt{100010} on IR bits
+28--23. Its flag is a single multi-controlled NOT with seven controls, the six IR bits
+and the running qubit:
+\[
+  f_{\mathrm{addimm}} \mathrel{\oplus}= r \wedge \mathrm{IR}_{28} \wedge \overline{\mathrm{IR}_{27}}
+  \wedge \overline{\mathrm{IR}_{26}} \wedge \overline{\mathrm{IR}_{25}} \wedge \mathrm{IR}_{24}
+  \wedge \overline{\mathrm{IR}_{23}} .
+\]
+Negated controls are X gates before and after; the seven-control NOT is a chain of 11
+Toffoli gates through 5 ancillas. Every other class has its own flag; for this word only
+$f_{\mathrm{addimm}}$ becomes 1. Sub-fields are read directly from IR: $\mathrm{IR}_{30}$ (add or
+subtract), $\mathrm{IR}_{29}$ (set flags), $\mathrm{IR}_{22}$ (shift of the immediate).
+
+\paragraph{Operands.} The first operand $A$ is register Rn, read by a multiplexer: for each
+register $k$, a select qubit $(\mathrm{IR}_{9..5} = k) \wedge \mathrm{enable}$ (a six-control NOT)
+controls $W$ Toffoli gates that copy $X_k$ into $A$. The second operand is the immediate,
+$B_i \mathrel{\oplus}= f_{\mathrm{addimm}} \wedge \overline{\mathrm{IR}_{22}} \wedge \mathrm{IR}_{10+i}$, so
+$B = 3$.
+
+\paragraph{Addition.} The adder works out of place. With $p = A$, $q = B$ (inverted for
+subtraction) and $c_0$ the carry-in, every bit $i$ produces a fresh sum qubit and a fresh
+carry qubit,
+\[
+  s_i = p_i \oplus q_i \oplus c_i, \qquad
+  c_{i+1} = \mathrm{maj}(p_i, q_i, c_i) = p_i q_i \oplus p_i c_i \oplus q_i c_i ,
+\]
+which is three CNOT and three Toffoli gates (Figure~\ref{fig:slice}). For $W = 8$ the adder is
+24 CNOT and 24 Toffoli gates. The carries also give the C and V flags.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=9mm, y=7mm, every node/.style={font=\small}]
+  \foreach \y/\l in {4/{p_i}, 3/{q_i}, 2/{c_i}, 1/{s_i = 0}, 0/{c_{i+1} = 0}}
+    { \node[left] at (0,\y) {$\l$}; \draw (0,\y) -- (7,\y); }
+  \node[right] at (7,1) {$p_i \oplus q_i \oplus c_i$};
+  \node[right] at (7,0) {$\mathrm{maj}(p_i, q_i, c_i)$};
+  % CNOTs onto s_i
+  \foreach \x/\c in {1/4, 2/3, 3/2} {
+    \fill (\x,\c) circle (2pt); \draw (\x,\c) -- (\x,1);
+    \draw (\x,1) circle (5pt); \draw (\x,1-0.18) -- (\x,1+0.18); }
+  % Toffolis onto c_{i+1}
+  \foreach \x/\a/\b in {4/4/3, 5/4/2, 6/3/2} {
+    \fill (\x,\a) circle (2pt); \fill (\x,\b) circle (2pt); \draw (\x,\a) -- (\x,0);
+    \draw (\x,0) circle (5pt); \draw (\x,-0.18) -- (\x,0.18); }
+\end{tikzpicture}
+\caption{One bit of the adder: three CNOTs compute the sum bit and three Toffoli gates
+compute the carry (majority) into fresh qubits.}
+\label{fig:slice}
+\end{figure}
+
+\paragraph{Result and write-back.} The result register receives $R_i \mathrel{\oplus}=
+f_{\mathrm{addimm}} \wedge s_i$. The write enable of register $k$ is
+$(\mathrm{IR}_{4..0} = k) \wedge \mathrm{writes}$. $R$ and the enables are copied with CNOTs into
+fresh per-cycle qubits, the compute block runs backwards so that IR, flags, $A$, $B$, the
+sums and the carries return to $|0\rangle$, and the commit phase applies
+$\mathrm{CSWAP}(\mathit{we}_0, X_{0,i}, R'_i)$ for $i < W$. Afterwards X0 holds $a + 3$ and
+$R'$ holds the old value of X0. The next PC, $\mathrm{PC} + 1$, comes from the same adder
+structure on the PC qubits, and the following cycle fetches \texttt{ret}.
+
+\paragraph{Cost.} On a machine whose decoder implements only the classes this function needs
+(add/sub immediate, register branches and \texttt{HLT}), with $W = 8$, two registers and four
+program slots, one complete cycle is 1\,590 gates: 1\,034 Toffoli, 134 CNOT, 394 X and 28
+Fredkin gates, on 321 qubits. The full machine with all 27 classes and realistic memory sizes
+uses about $4\times10^{5}$ gates per cycle. The arithmetic itself is a small part of this;
+most of the cost is in the multiplexers over program memory, data memory and registers, and
+in the units that every cycle computes, such as the divider, whether the current instruction
+needs them or not.
+
 \section{Software structure}
 \label{sec:software}
 
