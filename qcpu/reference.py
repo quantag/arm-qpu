@@ -211,24 +211,38 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
             if highbit:
                 issues.append(f"step {step} (instr {idx}): pointer X{ptrs[0]} is used by an operation that depends "
                               "on bits above its W-bit encoding")
-            if chk.cls in ("cbz", "tbz"):
-                v = reg(bits(w, 0, 5), False)
-                if chk.cls == "cbz":
-                    m_ = (1 << ds) - 1
-                    same = ((v & m_) == 0) == ((enc(v) & m_) == 0)
-                else:
-                    b_ = bits(w, 31, 1) << 5 | bits(w, 19, 5)
-                    same = (v >> b_ & 1) == (enc(v) >> b_ & 1)
-                if not same:
-                    issues.append(f"step {step} (instr {idx}): {chk.cls.upper()} on pointer X{bits(w, 0, 5)} = 0x{v:x} "
-                                  "takes a different branch on its W-bit encoding (e.g. a pointer encoded as 0)")
-            _, fds, fb = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
-            if fb is not None:
-                er = lambda r, sp: enc(reg(r, sp))
-                _, _, eb = _flag_result(w, chk.cls, er, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
-                fm = (1 << fds) - 1
-                rn = reg(bits(w, 5, 5), chk.cls in ("addsub_imm", "addsub_ext")) & fm
-                pending_flags = (_nzcv(w, chk.cls, enc(rn) & fm, eb, fds), step, idx)
+        # Semantic check of the operations whose outcome depends on bits above the W-bit encoding.
+        # The machine holds every value v -- integer, address or immediate -- as enc(v), the sign
+        # extension of its low W bits. The outcome on the encodings must equal the outcome on the CPU.
+        if chk.cls in ("cbz", "tbz"):
+            v = reg(bits(w, 0, 5), False)
+            if chk.cls == "cbz":
+                m_ = (1 << ds) - 1
+                same = ((v & m_) == 0) == ((enc(v) & m_) == 0)
+            else:
+                b_ = bits(w, 31, 1) << 5 | bits(w, 19, 5)
+                same = (v >> b_ & 1) == (enc(v) >> b_ & 1)
+            if not same:
+                issues.append(f"step {step} (instr {idx}): {chk.cls.upper()} on X{bits(w, 0, 5)} = 0x{v:x} "
+                              "takes a different branch on its W-bit encoding (e.g. a pointer encoded as 0)")
+        nz0 = mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28
+        _, fds, fb = _flag_result(w, chk.cls, reg, nz0)
+        if fb is not None:
+            # second operand as the machine has it: computed from encoded registers, then encoded
+            # itself (an immediate such as a bit mask is held by its low W bits, like any value)
+            fm = (1 << fds) - 1
+            _, _, eb = _flag_result(w, chk.cls, lambda r, sp: enc(reg(r, sp)), nz0)
+            ea = enc(reg(bits(w, 5, 5), chk.cls in ("addsub_imm", "addsub_ext"))) & fm
+            eb = enc(eb) & fm
+            if chk.cls.startswith("logic"):
+                er = ea & eb
+            else:
+                er = ((ea - eb) if bits(w, 30, 1) else (ea + eb)) & fm
+            if not plain(er, fds):
+                issues.append(f"step {step} (instr {idx}): the flag-setting result on the W-bit encodings "
+                              "does not fit the model")
+            else:
+                pending_flags = (_nzcv(w, chk.cls, ea, eb, fds), step, idx)
         res, rds, op2 = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
         if res is not None and not fits(res, rds):
             issues.append(f"step {step} (instr {idx}): flag-setting result 0x{res:x} does not fit the {W}-bit model")
@@ -242,7 +256,7 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
         pc = mu.reg_read(A.UC_ARM64_REG_PC)
         if pending_flags is not None:
             if pending_flags[0] != mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28:
-                issues.append(f"step {step} (instr {idx}): flags computed on pointer encodings differ from the CPU")
+                issues.append(f"step {step} (instr {idx}): NZCV computed on the W-bit encodings differs from the CPU")
             pending_flags = None
         snap()
         for r in chk.writes:

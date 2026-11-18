@@ -263,59 +263,81 @@ different length interfere; without it, they do not.
 \label{sec:wbit}
 
 AArch64 registers are 64 bits wide, which would make every adder, multiplier and divider large. Our
-registers have $W$ bits, $8\le W\le16$. A $W$-bit register represents the 64-bit value (or, for
-32-bit instructions, the 32-bit value) obtained by sign-extending it. We say that a value $v$ of width
-$d\in\{32,64\}$ \emph{fits} if $v \equiv \mathrm{sext}_d(v \bmod 2^W)$, or if it is a pointer into the
-machine's code or data memory (Section~\ref{sec:software}); pointers are represented by their offset.
+registers have $W$ bits, $8\le W\le16$. Whatever a 64-bit value $v$ means---an integer, an address or
+an immediate such as a bit mask---the machine holds its \emph{encoding}
+\[
+  \mathrm{enc}(v) = \mathrm{sext}_{64}(v \bmod 2^W),
+\]
+the sign extension of its low $W$ bits (for 32-bit instructions, $\mathrm{sext}_{32}$). A run is
+\emph{exact} if after every cycle the machine state is the encoding of the AArch64 state, with NZCV
+and the PC equal. Two different properties of a value decide whether this holds.
 
-The machine computes, for every instruction, the low $W$ bits of its AArch64 result from the low $W$
-bits of its operands. This is exact unconditionally for operations whose low bits depend only on
-the low bits of the operands, and exact under a fit condition for the others:
+\begin{description}
+  \item[Representable integer.] $v$ of width $d\in\{32,64\}$ is representable if
+        $v \equiv \mathrm{enc}(v) \pmod{2^d}$: the encoding loses nothing, and $\mathrm{enc}(v)$
+        is $v$ itself.
+  \item[Encodable address.] $v$ is an encodable address if it lies in the data window
+        $[\mathtt{DATA\_BASE}-2^{W-1},\ \mathtt{DATA\_BASE}+2^{W-1})$ or the code window
+        $[\mathtt{CODE\_BASE},\ \mathtt{CODE\_BASE}+2^{W-1})$. Both bases have zero low bits, so
+        $\mathrm{enc}(v)$ is the offset of $v$ from its base. An address is \emph{not} a representable
+        integer: its encoding differs from it, and only some operations are exact on it.
+\end{description}
+
+\noindent The second property is a property of how a value is \emph{used}, not of the number. A
+constant equal to \texttt{0x10000000} is an encodable address when it is a pointer to the start of data
+memory, but in \texttt{tst x1, \#0x10000000} it is a bit mask, and the encoding of that mask is 0. The
+conditions below therefore never accept a value because it happens to lie in an address window, except
+where the operation is exact on encodings anyway.
 
 \begin{center}
 \small
-\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.47\textwidth}>{\raggedright\arraybackslash}X@{}}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}>{\raggedright\arraybackslash}X@{}}
 \toprule
-operations & condition for an exact low-$W$-bit result \\
+operations & condition for an exact result \\
 \midrule
-ADD, SUB, MUL, MADD, MSUB, AND, ORR, EOR, BIC, ORN, EON, LSL, MOVZ/MOVN/MOVK, ADRP, byte and halfword operand extensions & none; the low $W$ bits are determined by the low $W$ bits of the operands \\
-LSR, ASR (immediate, register, shifted operands), UBFM/SBFM, SDIV, UDIV, SMULL, UMULL, CBZ, CBNZ, TBZ, TBNZ, CSEL family, word and doubleword extensions & the source registers fit at the width they are read \\
-flag-setting forms: ADDS, SUBS, ANDS, BICS, CMP, CMN, TST, CCMP, CCMN & the operands after shift or extension, and the full-width result, fit \\
-loads and stores & the stored register fits; for a 64-bit load, the doubleword in memory fits \\
+ADD, SUB, MUL, MADD, MSUB, AND, ORR, EOR, BIC, ORN, EON, LSL, MOVZ/MOVN/MOVK, ADRP, CSEL, CSINC, operand extensions, indirect branches &
+none: the low $W$ bits of the result depend only on the low $W$ bits of the operands. Operands may be integers or addresses. \\
+LSR, ASR (immediate, register, shifted operand), UBFM/SBFM, SDIV, UDIV, SMULL, UMULL &
+every source is a representable integer at the width it is read; an address operand is reported. \\
+CBZ, CBNZ, TBZ, TBNZ &
+semantic: the branch decision on the encoding equals the decision on the real value. \\
+flag-setting forms: ADDS, SUBS, ANDS, BICS, CMP, CMN, TST, CCMP, CCMN &
+semantic: the operation on the encodings of both operands (immediates included) gives a result that is a
+representable integer, and its NZCV equals the NZCV of the CPU. In addition, the second operand and the
+result must be representable integers or encodable addresses. \\
+loads and stores & the address is an encodable data address; the stored register and, for a 64-bit load,
+the doubleword in memory are representable integers or encodable addresses \\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-\noindent If every instruction of a run satisfies its condition and every value written to a
-register fits, then by induction over the cycles the machine state after each cycle equals the low
-$W$ bits of the AArch64 state, including NZCV and the PC. The CPU reference checks these conditions
-for every instruction it executes: it checks every register read at the width at which it is read
-(64 bits for addresses, 32 or 64 bits for data), every register written, the second operand and the
-full result of every flag-setting instruction (including those whose result is discarded, such as
-\texttt{cmp}), and every memory access. A run with no violation is reported as exact. A run with a
+\noindent Every value written to a register must also be a representable integer or an encodable
+address. If every instruction of a run satisfies its condition, then by induction over the cycles
+the run is exact: the first row is exact by construction, the second because the encodings equal the
+values, and the third and fourth because the outcome is compared directly. The CPU reference checks all
+of these for every instruction it executes, at the width at which each register is read (64 bits for
+addresses, 32 or 64 bits for data), including flag-setting instructions whose result is discarded,
+such as \texttt{cmp} and \texttt{tst}. A run with no violation is reported as exact. A run with a
 violation is \emph{flagged}; it may still match.
 
-The check is sound only if the circuit implements each sub-form correctly. That is tested directly:
-every test compares the machine state with the CPU after every cycle (Section~\ref{sec:eval}). An
-earlier version of the machine treated the byte extensions UXTB and SXTB in \texttt{add (extended
-register)} as the identity, which is wrong for $W>8$ (for example, with $W=12$ and $\mathrm{X1}=256$,
-\texttt{add x0, x0, w1, uxtb} gave 256 instead of 0). The defect was found in review and fixed, and the
-boundary tests of Section~\ref{sec:eval} now cover every extension at every width.
+\paragraph{Consequences for pointers.} Pointer arithmetic with integers, pointer differences, moving,
+loading and storing pointers, and indirect calls are exact. A pointer to the start of data memory,
+\texttt{DATA\_BASE}, is encoded as 0, so \texttt{cbz} on it would take the NULL branch; the semantic
+check flags it. The output log occupies the first cells of data memory, so the linker places no C
+object at offset 0, and comparisons of two pointers into one array, the common case, are exact when
+their offsets have the same sign.
 
-\paragraph{Pointers.} A pointer into data memory or code does not fit by the definition above; the
-machine holds it as its offset, the low $W$ bits of the address (\texttt{DATA\_BASE} and
-\texttt{CODE\_BASE} have zero low bits). Adding and subtracting integers, subtracting two pointers,
-moving, loading and storing pointers, and indirect branches are exact on this encoding. Operations
-that depend on the bits above the encoding are not: a NULL test, a bit test, a comparison and the
-flags it sets, right shifts, division and bitfield extraction. The most direct case is the start of
-data memory, \texttt{DATA\_BASE}, which is encoded as 0, so \texttt{cbz} on a pointer to it takes the
-NULL branch. The model check therefore evaluates every \texttt{cbz}, \texttt{cbnz}, \texttt{tbz} and
-\texttt{tbnz} on a pointer both on the real value and on its encoding, recomputes the NZCV of every
-flag-setting instruction with a pointer operand from the encodings and compares it with the CPU, and
-reports any pointer operand of a right shift, division, long multiplication or bitfield move. Such
-runs are flagged. The output log occupies the first cells of data memory, so no C object is placed at
-offset 0, and pointer comparisons inside one array, the common case, are exact when the offsets have
-the same sign.
+\paragraph{Soundness of the check and two defects found in review.} The check is sound only if the
+circuit implements each sub-form as the table assumes and if the check itself follows the table. Both
+are tested: every test compares the machine with the CPU after every cycle (Section~\ref{sec:eval}),
+and a difference that the check did not predict is counted as an error. Review found two defects,
+both fixed. First, the circuit treated the byte extensions UXTB and SXTB in \texttt{add (extended
+register)} as the identity, which is wrong for $W>8$ (with $W=12$ and $\mathrm{X1}=256$,
+\texttt{add x0, x0, w1, uxtb} gave 256 instead of 0). Second, an earlier version of the check
+accepted every value in an address window as an address, also when it was a bit mask: with $W=12$ and
+$\mathrm{X1}=-1$, \texttt{tst x1, \#0x10000000; cset x0, eq} gives $\mathrm{X0}=0$ on the CPU and 1 on the
+machine, and the check reported nothing. The flag-setting and branch conditions are now semantic, as in
+the table. Both cases are regression tests in the boundary suite.
 
 A typical value that does not fit is the result of division by a constant, which compilers turn
 into a multiplication by a 32-bit ``magic'' constant.

@@ -71,6 +71,17 @@ def cases(W):
                      ["tst x7, #7", "cset w1, eq"], ["lsr x1, x7, #2"], ["mov x2, #3", "udiv x1, x7, x2"],
                      ["add x1, x7, #12", "sub x2, x1, x7", "str x1, [x7, #16]", "ldr x3, [x7, #16]"]):
             out.append(("pointer", pre + body, [0] * 7))
+    # 8. constants that coincide with DATA_BASE or CODE_BASE but are used as integers or bit masks
+    #    (regression: tst x1, #0x10000000 with X1 = -1 gave X0 = 1 unflagged at W = 12)
+    L = 1 << (W - 1)
+    for x in (-1, 0, 1, L - 1, -L):
+        for body in (["tst x1, #0x10000000", "cset x0, eq"], ["tst x1, #0x400000", "cset x0, ne"],
+                     ["ands x0, x1, #0x10000000", "cset x2, eq"],
+                     ["mov x2, #0x10000000", "cmp x1, x2", "cset x0, lt", "cset x3, eq"],
+                     ["mov x2, #0x400000", "adds x0, x1, x2", "cset x3, mi"],
+                     ["and x0, x1, #0x10000000", "cbz x0, 1f", "mov w3, #1", "1:"],
+                     ["eor x0, x1, #0x10000000", "tbnz x0, #28, 1f", "mov w3, #1", "1:"]):
+            out.append(("constants", body, [0, x, 0, 0, 0, 0, 0]))
     return out
 
 
