@@ -190,7 +190,7 @@ def main():
     classes = ALL_CLASSES if cfg["isa"] == "full" else tuple(sorted({c.cls for c in checks if c.ok} | {"hlt"}))
 
     # ---- CPU reference
-    ref = run_reference(words, W, prog["entry_index"], cpu_args, MEM, cells, sp_off=sp_off)
+    ref = run_reference(words, W, prog["entry_index"], cpu_args, MEM, cells, sp_off=sp_off, snapshots=True)
     executed = {}
     for i in ref["trace"]:
         executed[i] = executed.get(i, 0) + 1
@@ -227,7 +227,25 @@ def main():
     ones = m.load_bits(words, init, cells, pc=prog["entry_index"])
     backend = cfg["backend"]
     if backend == "simulator":
-        out = m.run_fast(ones)
+        mk = (1 << W) - 1
+        lock = dict(cycles=0, first_divergence=None)
+
+        def on_cycle(k, st):
+            # lockstep check: machine state after cycle k == CPU state after instruction k
+            if k >= len(ref["snapshots"]) or lock["first_divergence"]:
+                return
+            sn = ref["snapshots"][k]
+            for r, q in m.X.items():
+                if value(st, q) != sn["regs"][r] & mk:
+                    lock["first_divergence"] = f"cycle {k}: {'sp' if r == 31 else 'x%d' % r}"; return
+            if [st[x] for x in m.nzcv] != sn["flags"]:
+                lock["first_divergence"] = f"cycle {k}: NZCV"; return
+            for i, cell in enumerate(m.ram):
+                if value(st, cell) != int.from_bytes(sn["mem"][4 * i:4 * i + 4], "little") & mk:
+                    lock["first_divergence"] = f"cycle {k}: memory cell {i}"; return
+            lock["cycles"] = k + 1
+        out = m.run_fast(ones, on_cycle=on_cycle)
+        report["lockstep"] = lock
         st = out["state"]
         q = dict(regs={k: value(st, m.X[k]) for k in m.X}, flags=[st[x] for x in m.nzcv],
                  mem=[value(st, x) for x in m.ram], run=out["run"], trap=out["trap"],
@@ -259,6 +277,8 @@ def main():
         qtext, trunc = console.render(lambda i: sx(q["mem"][i], W) & 0xFFFFFFFF, image, ptr_off, records)
         report["output_truncated"] = trunc
     ok = all(r["match"] for r in rows) and mem_ok and flags_ok and trace_ok and q["run"] == 0 and not q["trap"]
+    if report.get("lockstep"):
+        ok = ok and report["lockstep"]["first_divergence"] is None
     report["result"] = dict(registers=rows, flags=dict(cpu=ref["flags"], qpu=q["flags"]), memory_match=mem_ok,
                             trace_match=trace_ok, halted=q["run"] == 0, trap=q["trap"], probability=q["probability"],
                             return_value=dict(cpu=sx(ref["regs"][0], W), qpu=sx(q["regs"][0], W)),
@@ -365,6 +385,10 @@ def finish(report, a, W, default_prefix, records):
             print(f"return value X0: CPU = {r['return_value']['cpu']}, QPU = {r['return_value']['qpu']}")
             if r["output"]["cpu"] is not None:
                 print(f"program output: CPU and QPU {'identical' if r['output']['match'] else 'DIFFER'}")
+        ls = report.get("lockstep")
+        if ls:
+            print("lockstep: " + (f"identical to the CPU after every one of {ls['cycles']} cycles" if not ls["first_divergence"]
+                                  else f"first divergence at {ls['first_divergence']}"))
         mc = report.get("machine")
         if mc:
             print(f"quantum machine: {mc['qubits']} qubits, {sum(mc['gates'].values())} gates ({mc['toffoli']} Toffoli), "
@@ -406,6 +430,7 @@ def markdown(r, W):
         L += ["", f"- NZCV flags: CPU {res['flags']['cpu']}, QPU {res['flags']['qpu']}",
               f"- data memory equal: {res['memory_match']}",
               f"- control-flow trace (PC per step) equal: {res['trace_match']}",
+              f"- lockstep (registers, flags and memory compared after every cycle): {r.get('lockstep')}",
               f"- halted: {res['halted']}, trap: {res['trap']}, probability of this outcome: {res['probability']:.3f}", ""]
     mc = r.get("machine")
     if mc:

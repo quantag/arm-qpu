@@ -50,6 +50,12 @@ def _flag_result(w, cls, reg, nzcv):
     elif cls in ("addsub_reg", "addsub_ext") and bits(w, 29, 1) or cls == "logic_reg" and bits(w, 29, 2) == 3:
         b = reg(bits(w, 16, 5), False) & m
         if cls == "addsub_ext":
+            opt = bits(w, 13, 3)
+            esz = 8 << (opt & 3)
+            if esz < 64:
+                b &= (1 << esz) - 1
+                if opt & 4 and b >> (esz - 1):
+                    b -= 1 << esz
             b = (b << bits(w, 10, 3)) & m
         else:
             k, t = bits(w, 10, 6), bits(w, 22, 2)
@@ -60,14 +66,33 @@ def _flag_result(w, cls, reg, nzcv):
         b = _decode_bitmask(bits(w, 22, 1), bits(w, 10, 6), bits(w, 16, 6), ds)
     elif cls == "ccmp":
         if not _cond_holds(bits(w, 12, 4), nzcv):
-            return None, ds
+            return None, ds, None
         b = bits(w, 16, 5) if bits(w, 11, 1) else reg(bits(w, 16, 5), False) & m
     else:
-        return None, ds
+        return None, ds, None
     rn = reg(bits(w, 5, 5), cls in ("addsub_imm", "addsub_ext")) & m
     if cls.startswith("logic"):
-        return rn & b, ds
-    return ((rn - b) if sub else (rn + b)) & m, ds
+        return rn & b, ds, b
+    return ((rn - b) if sub else (rn + b)) & m, ds, b
+
+
+def read_width(w, cls, r, ds):
+    """Width at which instruction w reads register r."""
+    if cls in MEMOPS:
+        if r == bits(w, 5, 5) or r == 31:
+            return 64                                   # base address
+        if cls == "ldst_reg" and r == bits(w, 16, 5):
+            return 32 if bits(w, 13, 1) == 0 else 64    # index: UXTW/SXTW read W, LSL/SXTX read X
+        return 64 if (bits(w, 31, 1) if cls in ("ld_pair", "st_pair") else bits(w, 30, 1)) else 32
+    if cls == "bfm" and bits(w, 10, 6) < 32:
+        return 32                                       # SXTW / UXTW-like: low half only
+    if cls == "addsub_ext" and r == bits(w, 16, 5):
+        return 64 if bits(w, 13, 2) == 3 else 32        # extended operand: X only for UXTX/SXTX
+    if cls == "maddl" and r != bits(w, 10, 5):
+        return 32                                       # SMULL/UMULL sources are W registers
+    if cls == "bra":
+        return 64
+    return ds
 
 
 def layout(code_words, slots):
@@ -76,7 +101,8 @@ def layout(code_words, slots):
     return list(code_words) + [0] * (slots - 1 - len(code_words)) + [HLT_WORD]
 
 
-def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_steps=100000, sp_off=None):
+def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_steps=100000, sp_off=None,
+                  snapshots=False):
     """words: full program-memory image from layout()."""
     slots = len(words)
     halt_idx = slots - 1
@@ -118,7 +144,14 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
             return mu.reg_read(A.UC_ARM64_REG_SP) if sp_ctx else 0
         return mu.reg_read(XREG[r])
 
-    trace = []
+    trace, snaps = [], []
+
+    def snap():
+        if snapshots:
+            nz = mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28
+            snaps.append(dict(regs=[mu.reg_read(XREG[k]) for k in range(31)] + [mu.reg_read(A.UC_ARM64_REG_SP)],
+                              flags=[(nz >> 3) & 1, (nz >> 2) & 1, (nz >> 1) & 1, nz & 1],
+                              mem=bytes(mu.mem_read(DATA_BASE, 4 * mem_words)) if mem_words else b""))
     pc = CODE_BASE + 4 * entry
     halted, error = False, None
     for step in range(max_steps):
@@ -130,6 +163,7 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
         trace.append(idx)
         if idx == halt_idx:
             halted = True
+            snap()
             break
         w = words[idx]
         chk = check(w, idx, slots)
@@ -137,22 +171,25 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
             error = f"reached instruction {idx} (0x{w:08x}) which is not supported: {chk.reason}"
             break
         ds = datasize(w, chk.cls)
-        if ds == 64:   # a 64-bit operation: every register value it reads must fit as a 64-bit value
-            rbits = 32 if chk.cls == "bfm" and bits(w, 10, 6) < 32 else 64
-            for r in chk.reads:
-                v = reg(r, True)
-                if not fits(v, rbits):
-                    issues.append(f"step {step} (instr {idx}): 64-bit read of {'SP' if r == 31 else 'X%d' % r}"
-                                  f" = 0x{v:x} does not fit the {W}-bit model")
-        res, rds = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
+        # every register value the instruction reads must fit the model in the width it is read at
+        for r in chk.reads:
+            v = reg(r, True)
+            rw = read_width(w, chk.cls, r, ds)
+            if not fits(v, rw):
+                issues.append(f"step {step} (instr {idx}): {rw}-bit read of {'SP' if r == 31 else 'X%d' % r}"
+                              f" = 0x{v:x} does not fit the {W}-bit model")
+        res, rds, op2 = _flag_result(w, chk.cls, reg, mu.reg_read(A.UC_ARM64_REG_NZCV) >> 28)
         if res is not None and not fits(res, rds):
             issues.append(f"step {step} (instr {idx}): flag-setting result 0x{res:x} does not fit the {W}-bit model")
+        if op2 is not None and not fits(op2, rds):
+            issues.append(f"step {step} (instr {idx}): flag-setting operand 0x{op2:x} does not fit the {W}-bit model")
         try:
             mu.emu_start(pc, CODE_BASE + 4 * slots + 0x1000, count=1)
         except UcError as e:
             error = f"CPU exception at instruction {idx}: {e}"
             break
         pc = mu.reg_read(A.UC_ARM64_REG_PC)
+        snap()
         for r in chk.writes:
             v = reg(r, True)
             base_wb = chk.cls in MEMOPS and r == bits(w, 5, 5) and not (is_load(w, chk.cls) and r == bits(w, 0, 5))
@@ -168,4 +205,4 @@ def run_reference(words, W, entry=0, args=(), mem_words=0, mem_init=(), max_step
     flags = [(nzcv >> 3) & 1, (nzcv >> 2) & 1, (nzcv >> 1) & 1, nzcv & 1]
     mem = [int.from_bytes(mu.mem_read(DATA_BASE + 4 * i, 4), "little") for i in range(mem_words)]
     return dict(regs=regs, flags=flags, mem=mem, trace=trace, halted=halted, error=error,
-                issues=issues, steps=len(trace), sp0=sp0)
+                issues=issues, steps=len(trace), sp0=sp0, snapshots=snaps)

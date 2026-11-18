@@ -154,7 +154,9 @@ everything is measured once, after the run.
 
 Limits: integers and pointers only (no `%f`); up to 6 arguments per call; `%s` works for
 string constants, not for text built in memory at run time; 32 output calls per run by
-default (`output_records`). `printf("text\n")` is often turned into `puts` by the compiler,
+default (`output_records`). Return values: `putchar` returns its character and `puts`
+returns 0, as in C. `printf` returns 0, not the number of characters written, because the
+text is only formatted after the run. `printf("text\n")` is often turned into `puts` by the compiler,
 which is supported.
 
 ## Compiling C to an ARM64 binary: clang or gcc
@@ -360,16 +362,24 @@ non-negative W-bit values, which is why `register_width: auto` grows W with prog
 ```bash
 python3 -m tests.test_c_programs clang   # C cases x -O0/-O1/-O2 + whole programs with printf
 python3 -m tests.test_c_programs gcc     # the same with aarch64-linux-gnu-gcc
-python3 -m tests.test_fuzz 500      # random A64 programs: one circuit, CPU vs QPU, regs/flags/memory/trace
+python3 -m tests.test_fuzz 300 7 8,12,16 # random A64 programs at three register widths
+python3 -m tests.test_edges 8,12,16      # boundary cases: extensions, flags, shifts, W/X forms, memory, mul/div
+python3 -m tests.test_simulators         # fast replay == fully materialised circuit == Qiskit Aer
+python3 -m tests.test_coherence          # a superposition of two ARM programs, and interference
+python3 -m tests.test_branching          # a superposed input taking two paths of different length
+python3 tools/compare_specialized.py     # interpreter vs a specialised reversible circuit
+python3 tools/test_report.py             # runs everything, writes docs/test_results.md
 ```
 
-`test_c_programs` covers factorization, gcd, Fibonacci, primality, popcount, Collatz, integer
-square root, modular exponentiation, max3, function calls, bubble sort (in memory) and binary
-search, plus the three example programs (`main` with printf), whose QPU output must equal
-the CPU output. With both clang and gcc every case matches the CPU, except the flagged `digit_sum`
-cases described above (gcc uses the multiply-by-constant trick even at `-O0`).
-The largest case (`bubble_sort` at `-O0`, about 800 000 qubits and 180 million gates) needs
-several GB of RAM. Run the two suites one after the other, not in parallel.
+Every comparison with the CPU is done after **every machine cycle** (registers, flags, data memory,
+PC), not only at the end. Each run falls into one class: *match*; *match-flagged* (it matched, but
+the model check reported values outside the W-bit model); *flagged* (it differed and the model check
+reported why); or *unflagged mismatch* (it differed and the check said nothing). An unflagged
+mismatch would be a bug, and the tests require that there are none. `docs/test_results.md` lists
+seeds, tool versions, the commit and the number of discarded runs.
+
+The largest C case (`bubble_sort` at `-O0`, about 800 000 qubits and 180 million gates) needs
+several GB of RAM. Run the two C suites one after the other, not in parallel.
 
 ## How the quantum machine works
 

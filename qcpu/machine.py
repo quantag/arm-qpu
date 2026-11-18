@@ -78,7 +78,7 @@ class QuantumARM:
         if not defer:
             self.build()
 
-    def run_fast(self, ones):
+    def run_fast(self, ones, on_cycle=None):
         """Exact basis-state simulation without materialising every cycle.
 
         Every cycle is the same gate list; only its per-cycle registers (results, history, next PC)
@@ -89,15 +89,16 @@ class QuantumARM:
         PC trace, trap and running bits. Qubit/gate totals are those of the full circuit."""
         from .bitsim import Streamer
         c = self.cfg
-        pc_in, run_in = self.pc, self.run[0]
-        n0 = self.n
-        self._step(0)
-        tmpl = self.g
-        self.g = []
-        step_ids = list(range(n0, self.n))                 # everything allocated by the cycle ...
-        pool = set(self.pool)
-        step_ids = [q for q in step_ids if q not in pool]  # ... except reused scratch (always back to 0)
-        npc, run_out, trap = self.pc, self.run[1], self.trap[0]
+        if not hasattr(self, "_tmpl"):                    # generate the cycle once, reuse it for every input
+            pc_in, run_in = self.pc, self.run[0]
+            n0 = self.n
+            self._step(0)
+            tmpl = self.g
+            self.g = []
+            pool = set(self.pool)
+            step_ids = [q for q in range(n0, self.n) if q not in pool]  # per-cycle qubits (scratch excluded)
+            self._tmpl = (tmpl, pc_in, run_in, self.pc, self.run[1], self.trap[0], step_ids)
+        tmpl, pc_in, run_in, npc, run_out, trap, step_ids = self._tmpl
         per_step = len(step_ids)
         self.template_gates = len(tmpl)
         sim = Streamer(ones)
@@ -106,11 +107,12 @@ class QuantumARM:
         trace = [sum(st[q] << i for i, q in enumerate(pc_in))]
         runs, traps = [], []
         for k in range(c.STEPS):
-            if k:
-                for q in step_ids: st[q] = 0
+            for q in step_ids: st[q] = 0
             sim(tmpl, self.n)
             trace.append(sum(st[q] << i for i, q in enumerate(npc)))
             runs.append(st[run_out]); traps.append(st[trap])
+            if on_cycle is not None:
+                on_cycle(k, st)
             for i, q in enumerate(pc_in): st[q] = st[npc[i]]
             st[run_in] = st[run_out]
         from collections import Counter
@@ -352,8 +354,19 @@ class QuantumARM:
             shreg = G("addsub_reg", "logic_reg")
             right = self.fresh_xor(ir[22], ir[23])
             self.gated_copy(shreg, self.shifter(Bm, ir[10:16], right, ir[23], 6, lsr=ir[22], sf=sf), Beff)
-        if has("addsub_ext"):     # extension is the identity in the sign-extended W-bit model; LSL #imm3
-            self.gated_copy(f["addsub_ext"], self.shifter(Bm, ir[10:13], Z, Z, 3), Beff)
+        if has("addsub_ext"):
+            # extend Rm by option = ir[15:13] (size = option<1:0>, signed = option<2>), then LSL #imm3.
+            # Byte forms change bits 8.. (zero, or copies of bit 7). Halfword and word forms change only
+            # bits >= 16 / >= 32, which a W <= 16 register does not hold: their low W bits are exact.
+            isB = self.fresh_match([(ir[13], 0), (ir[14], 0)])
+            Bx = self.alloc(W)
+            for i in range(W):
+                if i < 8:
+                    self.cx(Bm[i], Bx[i])
+                else:
+                    self.mcx([(isB, 0), (Bm[i], 1)], Bx[i])
+                    self.mcx([(isB, 1), (ir[15], 1), (Bm[7], 1)], Bx[i])
+            self.gated_copy(f["addsub_ext"], self.shifter(Bx, ir[10:13], Z, Z, 3), Beff)
         if has("addsub_imm"):
             nosh = self.fresh_match([(f["addsub_imm"], 1), (ir[22], 0)])
             ysh = self.fresh_match([(f["addsub_imm"], 1), (ir[22], 1)])

@@ -13,24 +13,16 @@ import os
 from .reference import CODE_BASE, DATA_BASE
 
 # A64 machine code of the output stub (assembled once from the listing in docs/output_stub.s)
-OUTPUT_STUB = [
-    0x5280002c, 0x14000005,             # printf:  mov w12, #1 ; b common
-    0x5280004c, 0x14000003,             # puts:    mov w12, #2 ; b common
-    0x5280006c, 0x14000001,             # putchar: mov w12, #3 ; b common
-    0xd2a20009,                         # common:  mov x9, #0x10000000        (log at data offset 0)
-    0xb940012a,                         #          ldr w10, [x9]              (record count)
-    0x713ffd5f,                         #          cmp w10, #capacity         (patched)
-    0x54000182,                         #          b.hs done
-    0x1100054b, 0xb900012b,             #          add w11, w10, #1 ; str w11, [x9]
-    0x8b0b152a,                         #          add x10, x9, x11, lsl #5   (record = 32 bytes)
-    0xb900014c,                         #          str w12, [x10]             (kind)
-    0xb9000540, 0xb9000941, 0xb9000d42, 0xb9001143, 0xb9001544, 0xb9001945, 0xb9001d46,  # w0..w6
-    0x52800000, 0xd65f03c0,             # done:    mov w0, #0 ; ret
-    0xb94003e1, 0xb9400be2, 0xb94013e3, 0xb9401be4, 0xb94023e5, 0xb9402be6,  # Apple ABI printf:
-    0x17ffffe3,                         #          variadic args from the stack -> x1..x6 ; b printf
+OUTPUT_STUB = [   # assembled from docs/output_stub.s
+    0x5280002c, 0x5280000d, 0x14000007, 0x5280004c, 0x5280000d, 0x14000004,
+    0x5280006c, 0x12001c0d, 0x14000001, 0xd2a20009, 0xb940012a, 0x713ffd5f,
+    0x54000182, 0x1100054b, 0xb900012b, 0x8b0b152a, 0xb900014c, 0xb9000540,
+    0xb9000941, 0xb9000d42, 0xb9001143, 0xb9001544, 0xb9001945, 0xb9001d46,
+    0x2a0d03e0, 0xd65f03c0, 0xb94003e1, 0xb9400be2, 0xb94013e3, 0xb9401be4,
+    0xb94023e5, 0xb9402be6, 0x17ffffe0,
 ]
-STUB_ENTRY = {"printf": 0, "puts": 2, "putchar": 4, "printf@apple": 23}
-STUB_CAPACITY_WORD = 8
+STUB_ENTRY = {"printf": 0, "puts": 3, "putchar": 6, "printf@apple": 26}
+STUB_CAPACITY_WORD = 11
 OUTPUT_FUNCS = ("printf", "puts", "putchar")
 
 

@@ -5,12 +5,17 @@
 //   [DATA_BASE + 32*k]  kind (1 printf, 2 puts, 3 putchar), w0..w6
 // arm_qpu.py reads the log after the run and formats the text (qcpu/console.py).
 // Assembled once; the words are in qcpu/loader.py (OUTPUT_STUB). "capacity" is patched.
+// Return values: putchar returns its argument, puts returns 0; printf returns 0, not the number
+// of characters, because the text is only formatted after the run.
         .text
 printf_:  mov  w12, #1
+          mov  w13, #0                   // printf returns 0 (the character count is not known on the QPU)
           b    common
 puts_:    mov  w12, #2
+          mov  w13, #0                   // puts returns 0 (a non-negative value, as C requires)
           b    common
 putchar_: mov  w12, #3
+          and  w13, w0, #0xff            // putchar returns the character written
           b    common
 common:   movz x9, #0x1000, lsl #16      // x9 = DATA_BASE (0x10000000)
           ldr  w10, [x9]                 // count
@@ -27,7 +32,7 @@ common:   movz x9, #0x1000, lsl #16      // x9 = DATA_BASE (0x10000000)
           str  w4, [x10, #20]
           str  w5, [x10, #24]
           str  w6, [x10, #28]
-1:        mov  w0, #0
+1:        mov  w0, w13
           ret
 // Apple arm64 ABI: variadic arguments are passed on the stack, not in x1..x7
 apple_printf_:
