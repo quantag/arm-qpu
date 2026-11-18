@@ -85,7 +85,7 @@ Hello from the QPU!
 MATCH: the QPU produced the same result as the CPU
 return value X0: CPU = 0, QPU = 0
 program output: CPU and QPU identical
-quantum machine: 504168 qubits, 88919129 gates (55966482 Toffoli), 221 steps, W = 12
+quantum machine: 520364 qubits, 91883088 gates (57841320 Toffoli), 228 steps, W = 12
 report: hello.main.report.md
 ```
 
