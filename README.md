@@ -35,19 +35,30 @@ int factorize(int n, int *out) {          /* writes the prime factors to out[] *
 }
 ```
 
-One command compiles it for AArch64 and runs it on the QPU and the CPU (`&0` = pointer to
-data-memory cell 0, where the factors are written):
+**Step 1: compile the C file to an ARM64 binary** (clang or gcc, your choice):
 
 ```bash
-python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
+clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o factor.o
+# or
+aarch64-linux-gnu-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
+```
+
+`factor.o` is a normal AArch64 ELF object file. These are the bytes that run on the CPU and
+on the QPU. You can inspect them with `llvm-objdump -d factor.o` (or
+`aarch64-linux-gnu-objdump -d factor.o`).
+
+**Step 2: run the binary on the QPU and the CPU** (`&0` = pointer to data-memory cell 0,
+where the factors are written):
+
+```bash
+python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
 ```
 
 ```
-compiled: clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o .../factor.o
 MATCH: the QPU produced the same result as the CPU
 return value X0: CPU = 4, QPU = 4
 quantum machine: 21201 qubits, 3491712 gates (1917792 Toffoli), 72 steps
-report: examples/factor.factorize.report.md
+report: factor.factorize.report.md
 ```
 
 The report shows data memory `[2, 2, 3, 7, ...]` on both machines, identical registers,
@@ -56,12 +67,16 @@ not, and the circuit's resources.
 
 Options: `--entry FUNC` (default `main`, else the first function), `--args` for X0, X1, ...
 (`&k` = pointer to data cell k), `--mem=1,2,3` to initialise data memory (32-bit cells),
-`--cc clang|gcc` and `-O 0|1|2|s` for `.c` input, `--config config.json`, `--report PREFIX`.
+`--config config.json`, `--report PREFIX`.
+
+*Shortcut:* `arm_qpu.py` also accepts the `.c` file and runs step 1 itself
+(`python3 arm_qpu.py examples/factor.c --cc gcc -O 1 --entry factorize --args 84 '&0'`).
+It prints the exact compile command it used. The binary is still what gets executed.
 
 ## Compiling C to an ARM64 binary: clang or gcc
 
-Both compilers are supported and tested; they produce the same results. You can pass a `.c`
-file (the runner compiles it), or compile yourself and pass the object file (`.o`).
+Both compilers are supported and tested; they produce the same results. Compile with `-c` to
+an object file (`.o`) and pass that file to `arm_qpu.py`.
 
 | compiler | command | output |
 |---|---|---|
@@ -75,7 +90,7 @@ file (the runner compiles it), or compile yourself and pass the object file (`.o
 python3 arm_qpu.py prog.o --entry my_function --args 5 7
 ```
 
-With `.c` input, `compiler` in `config.json` (or `--cc`) chooses the compiler. `auto` tries
+For the `.c` shortcut, `compiler` in `config.json` (or `--cc`) chooses the compiler. `auto` tries
 `clang`, then `aarch64-linux-gnu-gcc`, `aarch64-none-linux-gnu-gcc`, `aarch64-none-elf-gcc`
 and `aarch64-elf-gcc`. Write plain functions with no libc calls: there is no `printf` or
 `malloc` on the quantum machine. Return results in the return value or through a pointer
@@ -86,7 +101,7 @@ argument (`&k`).
 ```bash
 # 1. tools: Python, git, and a compiler (clang, or gcc for AArch64, or both)
 sudo apt update
-sudo apt install -y python3 python3-venv git clang gcc-aarch64-linux-gnu
+sudo apt install -y python3 python3-venv git clang llvm gcc-aarch64-linux-gnu
 
 # 2. get the code and its Python packages
 git clone https://github.com/quantag/arm-qpu.git
@@ -95,20 +110,23 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. run C on the quantum machine, with either compiler
-python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
-python3 arm_qpu.py examples/factor.c --cc gcc --entry factorize --args 84 '&0'
+# 3. compile C to an ARM64 binary: with clang ...
+clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples/factor.c -o factor.o
+#    ... or with gcc
+aarch64-linux-gnu-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
 
-# 4. or compile yourself and pass the object file
-aarch64-linux-gnu-gcc -O2 -c examples/algorithms.c -o algorithms.o
-python3 arm_qpu.py algorithms.o --entry gcd --args 84 36
+# 4. (optional) look at the ARM machine code you are about to run
+llvm-objdump -d factor.o
 
-# 5. the report
-less examples/factor.factorize.report.md
+# 5. run the binary on the quantum machine (and on the CPU reference)
+python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
+
+# 6. read the report
+less factor.factorize.report.md
 ```
 
-On Fedora: `sudo dnf install clang gcc-aarch64-linux-gnu python3 git`. On Arch Linux:
-`sudo pacman -S clang aarch64-linux-gnu-gcc python git`.
+On Fedora: `sudo dnf install clang llvm gcc-aarch64-linux-gnu python3 git`. On Arch Linux:
+`sudo pacman -S clang llvm aarch64-linux-gnu-gcc python git`.
 
 ## Step-by-step: Windows
 
@@ -128,8 +146,17 @@ py -m venv .venv
 .venv\Scripts\Activate.ps1        # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 pip install -r requirements.txt
 
-# 3. run C on the quantum machine (keep '&0' in single quotes in PowerShell)
-python arm_qpu.py examples\factor.c --entry factorize --args 84 '&0'
+# 3. compile C to an ARM64 binary with clang
+clang --target=aarch64-linux-gnu -O1 -ffreestanding -c examples\factor.c -o factor.o
+
+# 4. (optional) look at the ARM machine code
+llvm-objdump -d factor.o
+
+# 5. run the binary on the quantum machine (keep '&0' in single quotes in PowerShell)
+python arm_qpu.py factor.o --entry factorize --args 84 '&0'
+
+# 6. read the report
+notepad factor.factorize.report.md
 ```
 
 **gcc on Windows.** Use the Arm GNU Toolchain:
@@ -138,11 +165,9 @@ python arm_qpu.py examples\factor.c --entry factorize --args 84 '&0'
    (aarch64-none-elf)" from https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads.
 2. Unzip it, for example to `C:\arm-gnu-toolchain`.
 3. Add its `bin` folder to PATH, then check: `aarch64-none-elf-gcc --version`.
-4. Run with gcc:
+4. Compile with gcc instead of clang (step 3 above), then run the binary as before:
 
 ```powershell
-python arm_qpu.py examples\factor.c --cc gcc --entry factorize --args 84 '&0'
-# or compile yourself:
 aarch64-none-elf-gcc -O1 -ffreestanding -c examples\factor.c -o factor.o
 python arm_qpu.py factor.o --entry factorize --args 84 '&0'
 ```
@@ -160,11 +185,20 @@ Inside Ubuntu, follow the Linux steps above. This gives you both compilers throu
 ## Step-by-step: macOS (Apple Silicon)
 
 ```bash
-xcode-select --install                 # Apple clang (native arm64)
+# 1. tools: Apple clang compiles natively for arm64
+xcode-select --install
+
+# 2. code and Python packages
 git clone https://github.com/quantag/arm-qpu.git && cd arm-qpu
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-python3 arm_qpu.py examples/factor.c --entry factorize --args 84 '&0'
-# gcc: brew install aarch64-elf-gcc, then add --cc gcc
+
+# 3. compile C to an ARM64 binary (a native arm64 Mach-O object)
+clang -O1 -c examples/factor.c -o factor.o
+#    or with gcc:  brew install aarch64-elf-gcc
+#                  aarch64-elf-gcc -O1 -ffreestanding -c examples/factor.c -o factor.o
+
+# 4. run the binary on the quantum machine
+python3 arm_qpu.py factor.o --entry factorize --args 84 '&0'
 ```
 
 ## config.json
