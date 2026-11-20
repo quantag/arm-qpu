@@ -39,6 +39,7 @@ sections = [
     ("Fast simulator vs full circuit vs Aer", [sys.executable, "-m", "tests.test_simulators", "30" if quick else "100", "5"]),
     ("Coherence: superposition of two programs", [sys.executable, "-m", "tests.test_coherence"]),
     ("Quantum branching", [sys.executable, "-m", "tests.test_branching"]),
+    ("Grover search with compiled C oracles", [sys.executable, "-m", "tests.test_grover"]),
     ("Interpreter vs specialised circuit", [sys.executable, "tools/compare_specialized.py"]),
 ]
 if not quick:

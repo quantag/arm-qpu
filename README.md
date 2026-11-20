@@ -135,6 +135,62 @@ The inputs go through a `volatile` variable, so the compiler cannot compute the 
 advance: the QPU computes them. `factor.c` and `algorithms.c` each take about 20 seconds to
 simulate on a laptop; `hello.c` about 7 seconds.
 
+## Grover search with a C function as the oracle
+
+`grover.py` uses a compiled C predicate as the oracle of Grover's algorithm. The predicate is
+ordinary C, `int f(int x)` returning 0 or 1, and runs as ARM machine code on the quantum machine:
+
+```c
+/* examples/grover_divisor.c */
+int divides91(int x)
+{
+    return x > 1 && 91 % x == 0;
+}
+```
+
+```bash
+python3 grover.py examples/grover_divisor.c --entry divides91 --bits 4 --iterations 0,1,2,3
+```
+
+```
+predicate divides91: 10 instructions, solutions over 0..15: [7, 13] (M = 2 of N = 16); cycles per input 5..9, common bound T = 9
+machine: W = 8, 9 instruction classes, 16 program slots, 9 cycles: 1762 qubits, 85374 gates (49680 Toffoli) per run of U
+basis check: the quantum machine computes f(x) correctly for all 16 inputs
+simulator: exact sparse state vector; optimal number of iterations for M/N = 2/16: 2
+k = 0: P(solution) exact 0.1250, theory 0.1250; measured 142/1000 = 0.142 [95% CI 0.122..0.165]; workspace restored with probability 1.0000
+k = 1: P(solution) exact 0.7812, theory 0.7813; measured 796/1000 = 0.796 [95% CI 0.770..0.820]; workspace restored with probability 1.0000
+k = 2: P(solution) exact 0.9453, theory 0.9453; measured 950/1000 = 0.950 [95% CI 0.935..0.962]; workspace restored with probability 1.0000
+k = 3: P(solution) exact 0.3301, theory 0.3301; measured 344/1000 = 0.344 [95% CI 0.315..0.374]; workspace restored with probability 1.0000
+PASS: amplitudes amplified as Grover's algorithm predicts, workspace restored in every shot
+```
+
+`x` is the low `--bits` bits of X0, put into superposition with Hadamard gates. One iteration is:
+
+1. **U**: run the ARM machine for T cycles. X0 becomes f(x); the history stays in per-cycle registers.
+2. **Z** on bit 0 of X0: phase −1 where f(x) = 1.
+3. **U⁻¹**: run the machine backwards. X0 is x again, and all work registers and the history are back to 0.
+4. **Diffusion** on the input qubits.
+
+Different inputs take different paths through the code (5 to 9 cycles here); T is the largest
+cycle count over the whole domain, so every branch halts. Before the quantum run, the tool checks
+every input on the CPU (it must halt, return 0 or 1 and stay inside the W-bit model) and on the
+quantum machine gate by gate. `--no-uncompute` drops step 3: the input then stays entangled with
+the result and the history, and the success probability falls to 5% instead of 95%.
+
+**Simulator.** The machine is a permutation circuit (X, CNOT, Toffoli, Fredkin), so with k input
+qubits in superposition the state has at most 2^k nonzero amplitudes, however many qubits the machine
+has. `qcpu/sparsesim.py` stores exactly those amplitudes. This is an exact simulation of the quantum
+state, including the interference, and it runs in about a second. `--backend aer` uses Qiskit Aer
+(matrix product state) instead; it agrees, but is practical only for tiny examples such as
+`examples/grover_tiny.c`. `tests/test_grover.py` checks the sparse simulator against Qiskit's dense
+statevector on random circuits and against Aer on the interpreter. All results are from simulation,
+not from quantum hardware. Grover's algorithm gives a quadratic reduction in oracle calls, but the
+interpreter makes each call far more expensive than a hand-built oracle, so this is a demonstration,
+not a speed-up.
+
+More examples: `examples/grover_square.c` (x² ≡ 9 mod 16, 4 solutions of 16, found with certainty in
+one iteration), and `--bits 6` with `divides91` (2 solutions of 64, P = 0.999 after 4 iterations).
+
 ## How printf works
 
 All computation, including every value that gets printed, happens on the QPU. Text formatting
@@ -367,6 +423,7 @@ python3 -m tests.test_edges 8,12,16      # boundary cases: extensions, flags, sh
 python3 -m tests.test_simulators         # fast replay == fully materialised circuit == Qiskit Aer
 python3 -m tests.test_coherence          # a superposition of two ARM programs, and interference
 python3 -m tests.test_branching          # a superposed input taking two paths of different length
+python3 -m tests.test_grover             # Grover search with compiled C predicates as oracles
 python3 tools/compare_specialized.py     # interpreter vs a specialised reversible circuit
 python3 tools/test_report.py             # runs everything, writes docs/test_results.md
 ```
