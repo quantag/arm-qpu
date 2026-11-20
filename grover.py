@@ -76,7 +76,7 @@ def prepare(path, entry, cfg, cc=None, opt=None):
     if bad:
         sys.exit("error: unsupported instructions in the predicate: " + "; ".join(c.reason for c in bad))
     if any(c.cls in MEMOPS for c in checks) or prog["data_end"] > prog["data_offset"]:
-        sys.exit("error: the predicate uses memory; this tool supports register-only predicates "
+        sys.exit("error: the function uses memory; this tool supports register-only functions "
                  "(compile with -O1 or -O2 so that locals stay in registers)")
     return prog, code, slots, checks
 

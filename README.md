@@ -191,6 +191,91 @@ not a speed-up.
 More examples: `examples/grover_square.c` (x² ≡ 9 mod 16, 4 solutions of 16, found with certainty in
 one iteration), and `--bits 6` with `divides91` (2 solutions of 64, P = 0.999 after 4 iterations).
 
+## Shor's algorithm with modexp written in C
+
+`shor.py` factors a small number with Shor's algorithm. The classical core of the algorithm,
+`a^x mod N`, is an ordinary C function that runs as ARM machine code on the quantum machine, with the
+exponent `x` in superposition:
+
+```c
+/* examples/shor_modexp.c */
+unsigned modexp(unsigned a, unsigned x, unsigned n)
+{
+    unsigned r = 1;
+    while (x) {
+        if (x & 1)
+            r = r * a % n;
+        a = a * a % n;
+        x >>= 1;
+    }
+    return r;
+}
+```
+
+```bash
+python3 shor.py --N 15 --a 7
+```
+
+```
+modexp: 18 instructions; a = 7, N = 15; exponent register: t = 8 qubits (x = 0..255)
+CPU check: a^x mod N correct for all 256 exponents, 4..101 machine cycles, all inside the 9-bit model
+machine: W = 9, 12 instruction classes, 32 program slots, 101 cycles: 6526 qubits, 2581560 gates (1229776 Toffoli) per run of U
+circuit: H on x, U, copy, U^-1, inverse QFT: 6530 qubits, 5163180 gates
+after U: X0 = a^x mod N in all 256 branches, every branch halted, no trap
+after U^-1: exponent register restored: True; all 6518 work and history qubits back in their initial state: True
+measurement of x, exact probabilities (textbook value in brackets):
+    y =     0  P = 0.2500 (0.2500)  y/2^t = 0.0000  no order found
+    y =    64  P = 0.2500 (0.2500)  y/2^t = 0.2500  r = 4 -> 15 = 3 x 5
+    y =   128  P = 0.2500 (0.2500)  y/2^t = 0.5000  r = 4 -> 15 = 3 x 5
+    y =   192  P = 0.2500 (0.2500)  y/2^t = 0.7500  r = 4 -> 15 = 3 x 5
+largest difference from the textbook distribution: 6.1e-16
+1000 shots (seed 2026): 777 gave the order r = 4, 777 gave the factors = 0.777 [95% CI 0.750..0.802]
+exact probability per shot: order 0.7500, factors 0.7500; a uniformly random y would give the factors with probability 0.0586
+RESULT: 15 = 3 x 5   (order of 7 modulo 15: r = 4)
+```
+
+One run is:
+
+1. **H** on the exponent qubits: all 2^t exponents at once.
+2. **U**: the ARM machine runs `modexp`. The loop runs once per bit of `x`, so the branches take
+   different numbers of cycles (4 to 101 here); the machine runs for the largest.
+3. **Copy** the result into a fresh register (CNOT gates).
+4. **U⁻¹**: the machine runs backwards. The exponent and every work and history qubit are restored.
+5. **Inverse quantum Fourier transform** on the exponent qubits, then measure them.
+6. Classical: continued fractions turn the measured `y` into the order `r`; `gcd(a^(r/2) ± 1, N)`
+   gives the factors.
+
+| N | base a | exponent qubits | cycles | qubits | gates | P(factors) per shot | same for a random y |
+|---|---|---|---|---|---|---|---|
+| 15 = 3 × 5 | 7 | 8 | 4–101 | 6 530 | 5.2 million | 0.750 | 0.059 |
+| 21 = 3 × 7 | 2 | 9 | 4–113 | 7 434 | 6.3 million | 0.623 | 0.045 |
+| 33 = 3 × 11 | 5 | 11 | 4–137 | 9 418 | 9.0 million | 0.679 | 0.018 |
+| 35 = 5 × 7 | 2 | 11 | 4–137 | 9 418 | 9.0 million | 0.706 | 0.011 |
+
+Without `--a` the tool tries the bases 2, 3, 4, ... as the classical part of Shor's algorithm does:
+for N = 33, bases 2 and 4 find the order but give no factor, and base 5 gives 3 × 11.
+`--cc gcc` and `-O 2` work as well; `-O0` does not, because it keeps locals in memory.
+
+**What is checked on every run.** The CPU runs `modexp` for every exponent of the domain (correct value,
+halts, inside the W-bit model). After U, every branch of the superposition holds the right value and
+has halted. After U⁻¹, the exponent is back and every work qubit is in its initial state. The exact
+outcome distribution equals the textbook distribution of order finding, computed independently with a
+classical FFT. With `--no-uncompute` (no step 4) the outcome is uniform and the success rate drops to
+the chance level in the last column: the history must be uncomputed for the branches to interfere.
+
+**What this shows, and what it does not.**
+
+- The oracle is the general square-and-multiply routine, compiled by an ordinary C compiler. Nothing
+  in it uses the order or the factors; the same binary serves every `a` and `N` that fit the register
+  width.
+- The numbers are tiny and everything is simulated (`qcpu/sparsesim.py`, exact; the circuit is far
+  too large for Qiskit Aer). The simulator is checked against Qiskit's dense statevector on random
+  circuits, and the QFT gate list against the discrete Fourier transform (`tests/test_shor.py`).
+- It is not an efficient way to factor. A circuit built by hand for modular exponentiation needs
+  about a dozen qubits for N = 15; the interpreter needs 6 530, almost all of them history. The speed-up
+  belongs to Shor's algorithm. What the machine adds is that the classical part comes straight from
+  compiled code.
+
 ## How printf works
 
 All computation, including every value that gets printed, happens on the QPU. Text formatting
@@ -424,6 +509,7 @@ python3 -m tests.test_simulators         # fast replay == fully materialised cir
 python3 -m tests.test_coherence          # a superposition of two ARM programs, and interference
 python3 -m tests.test_branching          # a superposed input taking two paths of different length
 python3 -m tests.test_grover             # Grover search with compiled C predicates as oracles
+python3 -m tests.test_shor               # Shor's algorithm with modexp compiled from C
 python3 tools/compare_specialized.py     # interpreter vs a specialised reversible circuit
 python3 tools/test_report.py             # runs everything, writes docs/test_results.md
 ```

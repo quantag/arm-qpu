@@ -40,6 +40,7 @@ sections = [
     ("Coherence: superposition of two programs", [sys.executable, "-m", "tests.test_coherence"]),
     ("Quantum branching", [sys.executable, "-m", "tests.test_branching"]),
     ("Grover search with compiled C oracles", [sys.executable, "-m", "tests.test_grover"]),
+    ("Shor's algorithm with modexp compiled from C", [sys.executable, "-m", "tests.test_shor"]),
     ("Interpreter vs specialised circuit", [sys.executable, "tools/compare_specialized.py"]),
 ]
 if not quick:
