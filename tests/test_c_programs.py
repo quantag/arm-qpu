@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Quantag IT Solutions GmbH
 """End-to-end: C programs compiled by clang (-O0/-O1/-O2) for AArch64, run by arm_qpu.py on the
 quantum interpreter (exact simulator backend) and on the CPU reference; every case must MATCH.
 Run: python3 -m tests.test_c_programs [clang|gcc]"""

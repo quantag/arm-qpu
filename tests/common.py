@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Quantag IT Solutions GmbH
 """Shared helpers for the tests: assemble A64 with clang, run a program on the CPU reference and on
 the quantum machine, and classify the outcome.
 
